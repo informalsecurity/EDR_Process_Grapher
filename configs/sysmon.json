@@ -1,0 +1,11 @@
+{
+    'parent_pid': 'process.parent.pid',
+    'parent_name': 'process.parent.name',
+    'child_pid': 'process.pid',
+    'child_name': 'process.name',
+    'child_cli': 'process.command_line',
+    'ComputerName': 'host.hostname',
+    'filter_field': 'winlog.event_id',
+    'event_filter': '1',
+    'ignore': 'SenseIR.exe'
+}

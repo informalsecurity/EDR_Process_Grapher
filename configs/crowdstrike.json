@@ -1,0 +1,13 @@
+{
+    'parent_pid': 'ParentProcessId_decimal',
+    'parent_name': 'ParentBaseFileName',
+    'parent_start': 'ProcessStartTime_decimal',
+    'child_pid': 'TargetProcessId_decimal',
+    'child_name': 'FileName',
+    'child_cli': 'CommandLine',
+    'child_start': 'ProcessStartTime_decimal',
+    'ComputerName': 'ComputerName',
+    'filter_field': 'event_simpleName',
+    'event_filter': 'ProcessRollup2',
+    'ignore' : 'SenseIR.exe'
+}
