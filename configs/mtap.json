@@ -1,0 +1,13 @@
+{
+    'parent_pid': 'Initiating Process Parent Id',
+    'parent_name': 'Initiating Process Parent File Name',
+    'parent_start': 'Initiating Process Parent Creation Time',
+    'child_pid': 'Initiating Process Id',
+    'child_name': 'Initiating Process File Name',
+    'child_cli': 'Initiating Process Command Line',
+    'child_start': 'Initiating Process Creation Time',
+    'ComputerName': 'Computer Name',
+    'ignore': 'SenseIR.exe',
+    'filter_field': '',
+    'event_filter': ''
+}
