@@ -34,7 +34,7 @@ MAGNIFYING GLASS - Indicated DNS Resolutions
 Use the mark as Malicious Button to highlight process trees known to be malicious
 <img width="1188" height="775" alt="image" src="https://github.com/user-attachments/assets/bfc75133-0f62-4722-8468-8039c10199ad" />
 
-## CONNTION MODE
+## CONNECTION MODE
 Hit CTRL+ALT to enter connection mode when injection between processes are identified.  Use the buttons on the Bottom left to clear connections if needed:
 <img width="1197" height="867" alt="image" src="https://github.com/user-attachments/assets/550bf19b-beec-4698-bada-cd796109878a" />
 
