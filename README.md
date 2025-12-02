@@ -20,6 +20,8 @@ Then navigate in your browser to:
 
 http://127.0.0.1:8000/process_grapher.html
 
+Load the created JSON file from the PowerShell script into the web page  by clicking on "Choose File"
+
 # Results
 ## REVIEW DETAILED PROCESS DETAILS
 Select a process to reveal info, including unique network connections, DNS requests, Command Line, Files Dropped, and Rules/Techniques detected by SYSMON
