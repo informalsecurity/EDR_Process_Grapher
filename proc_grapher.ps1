@@ -1,533 +1,504 @@
-[CmdletBinding()]
-Param(
-    [Parameter(Mandatory)]
-    [alias("C")]
-    $Config,
-    [Parameter(Mandatory)]
-    [alias("I")]
-    $InFile,
-    [Parameter(Mandatory)]
-    [alias("O")]
-    $outfile
-    )
-$ErrorActionPreference = "Stop"
-$mapping = Get-Content $Config | ConvertFrom-Json
-$parent_pid = $mapping.parent_pid
-$parent_name = $mapping.parent_name
-$parent_start = $mapping.parent_start
-$child_pid = $mapping.child_pid
-$child_name = $mapping.child_name
-$child_start = $mapping.child_start
-$child_cli = $mapping.child_cli
-$ComputerName = $mapping.ComputerName
-$filter_field = $mapping.filter_field
-$event_filter = $mapping.event_filter
-$ignore = $mapping.ignore -Split ","
-If ($filter_field -like "*.*") {
-    $filter_field = $filter_field -Split "\."
-}
-If ($parent_pid -like "*.*") {
-    $parent_pid = $parent_pid -Split "\."
-}
-If ($parent_name -like "*.*") {
-    $parent_name = $parent_name -Split "\."
-}
-If ($child_pid -like "*.*") {
-    $child_pid = $child_pid -Split "\."
-}
-If ($ComputerName -like "*.*") {
-    $ComputerName = $ComputerName -Split "\."
-}
-If ($child_name -like "*.*") {
-    $child_name = $child_name -Split "\."
-}
-If ($child_cli -like "*.*") {
-    $child_cli = $child_cli -Split "\."
-}
-#Is a file or directory
-if ((Get-Item $InFile) -is [System.IO.DirectoryInfo]) {
-    $InFiles = gci $InFile
-    $temp = @()
-    foreach ($tFile in $InFiles) {
-        If ($tFile -like "*.csv") {
-            $temp += Import-Csv $tFile
+﻿$file_path = Read-Host "Provide the full path to all Sysmon EVTX (already converted to JSON) JSON files:"
+$files = gci $file_path -Recurse -Filter *Sysmon*.json
+$fcount = $files.Count
+$counter = 0
+foreach ($file in $files) {
+    $counter++
+    $fname = $file.FullName
+    Write-Host "Working on $counter of $fcount - $fname"
+    $pid_dict = @{}
+    $pid_user_dict = @{}
+    $pid_dns = @{} #DNSEvent (DNS query)
+    $pid_connect = @{} #Network connection
+    $pid_create = @{} #FileCreate
+    $pid_time = @{} 
+    $cli_dict = @{}
+    $pname_dict = @{}
+    $xprocess_dict = @{} #source - key, values destinations
+    $rules_dict = @{}
+    $hashes_dict = @{}
+    $system_name = ($file.Name -Split "-")[1]
+    Get-Content -Path $file.FullName -ReadCount 1 | ForEach-Object {
+        $temp = ($_ | convertFrom-Json)
+        $type = $temp.event.action
+        $message = ($_ | convertFrom-Json).message
+        $tpid = $null
+        $tpguid = $null
+        $ppguid = $null
+        $pname = $null
+        $ppname = $null
+        $fcreate = $null
+        $domain_name = $null
+        $puser = $null
+        $pcli = $null
+        $cli = $null
+        $targetguid = $null
+        $sourceguid = $null
+        $parent_pid = $null
+        $ptime = $temp.event.created
+        $fsha256 = $null
+        $frules = @()
+        function clean($item) {
+            $item = $item -Replace "}",""
+            $item = $item -Replace "{",""
+            $item = $item.Trim()
+            $item = $item.ToUpper()
+            return $item
         }
-        If ($tFile -like "*.json") {
-            $temp += Get-Content $tFile | ConvertFrom-Json
+        foreach ($line in ($message -Split "\n")) {
+            if ($line -like "ProcessId*") {
+                $tpid = ($line -Split ":")[1].Trim()
+            }
+            if ($line -like "ProcessGuid*") {
+                $tpguid = ($line -Split ":")[1].Trim()
+                $tpguid = clean $tpguid
+                
+            }
+            if ($line -like "ParentProcessId*") {
+                $parent_pid = ($line -Split ":")[1].Trim()
+            }
+            if ($line -like "ParentProcessGuid*") {
+                $ppguid = ($line -Split ":")[1].Trim()
+                $ppguid = clean $ppguid
+            }
+            if ($line -like "SourceProcessGuid*") {
+                $sourceguid = ($line -Split ":")[1].Trim()
+                $sourceguid = clean $sourceguid
+            }
+            if ($line -like "TargetProcessGuid*") {
+                $targetguid = ($line -Split ":")[1].Trim()
+                $targetguid = clean $targetguid
+            }
+            if ($line -like "SourceImage*") {
+                $sourceimage = (($line -replace "SourceImage: ",'') -Split "\\")[-1]
+                $sourceimage = $sourceimage.ToUpper().Trim()
+            }
+            if ($line -like "TargetImage*") {
+                $targetimage = (($line -replace "TargetImage: ",'') -Split "\\")[-1]
+                $targetimage = $targetimage.ToUpper().Trim()
+            }
+            if ($line -like "Image:*") {
+                $pname = (($line -replace "Image: ",'') -Split "\\")[-1]
+                $pname = $pname.ToUpper().Trim()
+            }
+            if ($line -like "ParentImage*") {
+                $ppname = (($line -replace "ParentImage: ",'') -Split "\\")[-1]
+                $ppname = $ppname.ToUpper().Trim()
+            }
+            if ($line -like "CommandLine*") {
+                $cli = ($line -replace "CommandLine: ",'').Trim()
+                $cli = $cli.ToUpper().Trim()
+            }
+            if ($line -like "ParentCommandLine*") {
+                $pcli = ($line -replace "ParentCommandLine: ",'').Trim()
+                $pcli = $pcli.ToUpper().Trim()
+            }
+            if ($line -like "User:*") {
+                $user = ($line -Split ":")[1].Trim()
+                $user = $user.ToUpper().Trim()
+            }
+            if ($line -like "ParentUser:*") {
+                $puser = ($line -Split ":")[1].Trim()
+                $puser = $puser.ToUpper().Trim()
+            }
+            if ($line -like "QueryName:*") {
+                $domain_name = ($line -Split ":")[1].Trim()
+                $domain_name = $domain_name.ToUpper().Trim()
+            }
+            if ($line -like "DestinationIp:*") {
+                $dip = ($line -Split ":")[1].Trim()
+            }
+            if ($line -like "DestinationPort:*") {
+                $dport = ($line -Split ":")[1].Trim()
+            }
+            if ($line -like "TargetFilename:*") {
+                $fcreate = ($line -replace "TargetFilename: ",'').Trim()
+                $fcreate = $fcreate.ToUpper().Trim()
+            }
+            if ($line -like "Hashes:*") {
+                $fsha256_arr = ($line -replace "Hashes: ",'') -Split ","
+                foreach ($hash in $fsha256_arr) {
+                    if ($hash -like "SHA256*") {
+                        $fsha256 = ($hash -Replace "SHA256=","").Trim().ToUpper()
+                    }
+                }
+            }
+            
+            if ($line -like "RuleName:*") {
+                $frule_arr = ($line -replace "RuleName: ",'') -Split ","
+                foreach ($item in $frule_arr) {
+                    if ($item -like "technique_name*") {
+                        $frules += ($item -Replace "technique_name=","").Trim().ToUpper()
+                    }
+                }
+            }
+        
         }
-        If ($tFile -like "*.xml") {
-            [xml]$temp += Get-Content $tFile
-        }
-        if ($event_filter -ne "") {
-            if ($filter_field.GetType().BaseType.Name -eq "Array") {
-                if ($filter_field.Count -eq 2) {
-                    $1 = $filter_field[0]
-                    $2 = $filter_field[1]
-                    $temp = $temp | Where-Object {$_.$1.$2 -eq $event_filter}
-                } elseif ($filter_field.Count -eq 3) {
-                    $1 = $filter_field[0]
-                    $2 = $filter_field[1]
-                    $3 = $filter_field[2]
-                    $temp = $temp | Where-Object {$_.$1.$2 -eq $event_filter}
+        
+        if ($frules.count -ne 0) {
+            if ($tpguid -ne $null) {
+                if ($pid_connect.ContainsKey($tpguid)) {
+                    $rules_dict[$tpguid]+=$frules
+                    $rules_dict[$tpguid] =  @($rules_dict[$tpguid] | Sort-Object | Get-Unique)
                 } else {
-                    Write-Host "Too many periods in the Filter Field - only up to three supported currently"
+                    $rules_dict[$tpguid]+=@()
+                    $rules_dict[$tpguid]+=$frules
+                    $rules_dict[$tpguid] =  @($rules_dict[$tpguid] | Sort-Object | Get-Unique)
                 }
-
-            } else {
-                $temp = $temp | Where-Object {$_.$filter_field -eq $event_filter}
             }
         }
-    }
-} else {
-    If ($InFile -like "*.csv") {
-        $temp = Import-Csv $InFile
-    }
-    If ($InFile -like "*.json") {
-        $temp = Get-Content $InFile | ConvertFrom-Json
-    }
-    If ($InFile -like "*.xml") {
-        [xml]$temp = Get-Content $InFile
-    }
-    if ($event_filter -ne "") {
-        if ($filter_field.GetType().BaseType.Name -eq "Array") {
-            if ($filter_field.Count -eq 2) {
-                $1 = $filter_field[0]
-                $2 = $filter_field[1]
-                $temp = $temp | Where-Object {$_.$1.$2 -eq $event_filter}
-            } elseif ($filter_field.Count -eq 3) {
-                $1 = $filter_field[0]
-                $2 = $filter_field[1]
-                $3 = $filter_field[2]
-                $temp = $temp | Where-Object {$_.$1.$2 -eq $event_filter}
+        if ($type -eq "Network connection") {
+            $remote = $dip + ":" + $dport
+            if ($pid_connect.ContainsKey($tpguid)) {
+                $pid_connect[$tpguid]+=$remote
+                $pid_connect[$tpguid] =  @($pid_connect[$tpguid] | Sort-Object | Get-Unique)
             } else {
-                Write-Host "Too many periods in the Filter Field - only up to three supported currently"
+                $pid_connect[$tpguid] = @()
+                $pid_connect[$tpguid]+=$remote
+                $pid_connect[$tpguid] =  @($pid_connect[$tpguid] | Sort-Object | Get-Unique)
             }
-
-        } else {
-            $temp = $temp | Where-Object {$_.$filter_field -eq $event_filter}
+        
         }
-    }
-}
-
-
-
-if ($ComputerName.GetType().BaseType.Name -eq "Array") {
-    if ($ComputerName.Count -eq 2) {
-        $1 = $ComputerName[0]
-        $2 = $ComputerName[1]
-        $Computer = $temp[0].$1.$2
-    } elseif ($ComputerName.Count -eq 3) {
-        $1 = $ComputerName[0]
-        $2 = $ComputerName[1]
-        $3 = $ComputerName[2]
-        $Computer = $temp[0].$1.$2.$3
-    }
-} else {
-    $Computer = $temp[0].$ComputerName
-}
-$vars = @()
-$hashtable = @{}
-
-$total = $temp.Count
-$i = 0
-
-foreach ($line in $temp) {
-    $i++
-    $ppid = $null
-    $parent = $null
-    if ($parent_pid.GetType().BaseType.Name -eq "Array") {
-        if ($parent_pid.Count -eq 2) {
-            $1 = $parent_pid[0]
-            $2 = $parent_pid[1]
-            $ppid = $line.$1.$2
-        } elseif ($parent_pid.Count -eq 3) {
-            $1 = $parent_pid[0]
-            $2 = $parent_pid[1]
-            $3 = $parent_pid[2]
-            $ppid = $line.$1.$2.$3
+        if ($type -eq "CreateRemoteThread") {
+            
+            if ($xprocess_dict.ContainsKey($sourceguid)) {
+                $xprocess_dict[$sourceguid]+=$targetguid
+                $xprocess_dict[$sourceguid] =  @($xprocess_dict[$sourceguid] | Sort-Object | Get-Unique)
+            } else {
+                $xprocess_dict[$sourceguid] = @()
+                $xprocess_dict[$sourceguid]+=$targetguid
+                $xprocess_dict[$sourceguid] =  @($xprocess_dict[$sourceguid] | Sort-Object | Get-Unique)
+            }
+            if ($pname_dict.ContainsKey($sourceguid)) {
+                $pname_dict[$sourceguid]+=$sourceimage
+                $pname_dict[$sourceguid] =  @($pname_dict[$sourceguid] | Sort-Object | Get-Unique)
+            } else {
+                $pname_dict[$sourceguid] = @()
+                $pname_dict[$sourceguid]+=$sourceimage
+                $pname_dict[$sourceguid] =  @($pname_dict[$sourceguid] | Sort-Object | Get-Unique)
+            }
+            if ($pname_dict.ContainsKey($targetguid)) {
+                $pname_dict[$targetguid]+=$targetimage
+                $pname_dict[$targetguid] =  @($pname_dict[$targetguid] | Sort-Object | Get-Unique)
+            } else {
+                $pname_dict[$targetguid] = @()
+                $pname_dict[$targetguid]+=$targetimage
+                $pname_dict[$targetguid] =  @($pname_dict[$targetguid] | Sort-Object | Get-Unique)
+            }
+        
         }
-    } else {
-        $ppid = $line.$parent_pid
-    }
-    if ($ppid -eq "") {
-        $ppid = "0"
-    }
-    if ($parent_name.GetType().BaseType.Name -eq "Array") {
-        if ($parent_name.Count -eq 2) {
-            $1 = $parent_name[0]
-            $2 = $parent_name[1]
-            $pname = $line.$1.$2
-        } elseif ($parent_name.Count -eq 3) {
-            $1 = $parent_name[0]
-            $2 = $parent_name[1]
-            $3 = $parent_name[2]
-            $pname = $line.$1.$2.$3
+        if ($type -eq "FileCreate") {
+        
+            if ($pid_create.ContainsKey($tpguid)) {
+                $pid_create[$tpguid]+=$fcreate
+                $pid_create[$tpguid] =  @($pid_create[$tpguid] | Sort-Object | Get-Unique)
+            } else {
+                $pid_create[$tpguid] = @()
+                $pid_create[$tpguid]+=$fcreate
+                $pid_create[$tpguid] =  @($pid_create[$tpguid] | Sort-Object | Get-Unique)
+            }
         }
-    } else {
-        $pname = $line.$parent_name
-    }
-    if ($pname -eq "") {
-        $pname = "UNK_PNAME"
-    }
-    $parent = "$ppid ($pname)"
-    if (!($vars -Contains $parent )) {
-        if (!($ignore -Contains $pname)) {
-            $vars += $parent
-        }
-    }
-    $Completed = ($i/$total) * 100
-    Write-Progress -Activity "Search in Progress" -Status "$i Out of $total Complete:" -PercentComplete $Completed
-}
-$vars = $vars | Select -Unique
-
-foreach  ($item in $vars) {
-    if ($item -ne "") {
-        $hashtable[$item] = @()
-    }
-}
-$total = $temp.Count
-$i = 0
-foreach ($line in $temp) {
-    $i++
-    $ppid = $null
-    $cpid = $null
-    if ($parent_pid.GetType().BaseType.Name -eq "Array") {
-        if ($parent_pid.Count -eq 2) {
-            $1 = $parent_pid[0]
-            $2 = $parent_pid[1]
-            $ppid = $line.$1.$2
-        } elseif ($parent_pid.Count -eq 3) {
-            $1 = $parent_pid[0]
-            $2 = $parent_pid[1]
-            $3 = $parent_pid[2]
-            $ppid = $line.$1.$2.$3
-        }
-    } else {
-        $ppid = $line.$parent_pid
-    }
-    if ($ppid -eq "") {
-        $ppid = "0"
-    }
-    if ($parent_name.GetType().BaseType.Name -eq "Array") {
-        if ($parent_name.Count -eq 2) {
-            $1 = $parent_name[0]
-            $2 = $parent_name[1]
-            $pname = $line.$1.$2
-        } elseif ($parent_name.Count -eq 3) {
-            $1 = $parent_name[0]
-            $2 = $parent_name[1]
-            $3 = $parent_name[2]
-            $pname = $line.$1.$2.$3
-        }
-    } else {
-        $pname = $line.$parent_name
-    }
-    if ($pname -eq "") {
-        $pname = "UNK_PNAME"
-    }
-    $parent = "$ppid ($pname)"
-    if ($child_pid.GetType().BaseType.Name -eq "Array") {
-        if ($child_pid.Count -eq 2) {
-            $1 = $child_pid[0]
-            $2 = $child_pid[1]
-            $cpid = $line.$1.$2
-        } elseif ($child_pid.Count -eq 3) {
-            $1 = $child_pid[0]
-            $2 = $child_pid[1]
-            $3 = $child_pid[2]
-            $cpid = $line.$1.$2.$3
-        }
-    } else {
-        $cpid = $line.$child_pid
-    }
-    if ($cpid -eq "") {
-        $cpid = "UNK_PID"
-    }
-    if ($child_name.GetType().BaseType.Name -eq "Array") {
-        if ($child_name.Count -eq 2) {
-            $1 = $child_name[0]
-            $2 = $child_name[1]
-            $cpname = $line.$1.$2
-        } elseif ($child_name.Count -eq 3) {
-            $1 = $child_name[0]
-            $2 = $child_name[1]
-            $3 = $child_name[2]
-            $cpname = $line.$1.$2.$3
-        }
-    } else {
-        $cpname = $line.$child_name
-    }
-    if ($cpname -eq "") {
-        $cpname = "UNK_CPNAME"
-    }
-    $child = "$cpid ($cpname)"
-    if (!($ignore -Contains $pname)) {
-        if ($hashtable[$parent]) {
-            if (!($hashtable[$parent].Contains($child))) {
-                $hashtable[$parent] += $child
+        if ($type -eq "Process creation") {
+            if ($fsha256 -ne $null) {
+                if ($tpguid -ne $null) {
+                    $hashes_dict[$tpguid] = $fsha256
+                }
+            }
+            if (!($pid_time.ContainsKey($tpguid))) {
+                $pid_time[$tpguid] = $ptime
+            }
+            if ($parent_pid -eq $null) {
+                $parent_pid = 0
+            }
+            if ($pid_dict.ContainsKey($ppguid)) {
+                $pid_dict[$ppguid]+=$tpguid
+                $pid_dict[$ppguid] =  @($pid_dict[$ppguid] | Sort-Object | Get-Unique)
+            } else {
+                $pid_dict[$ppguid] = @()
+                $pid_dict[$ppguid]+=$tpguid
+                $pid_dict[$ppguid] =  @($pid_dict[$ppguid] | Sort-Object | Get-Unique)
+            }
+            if ($pid_user_dict.ContainsKey($ppguid)) {
+                $pid_user_dict[$ppguid]+=$puser
+                $pid_user_dict[$ppguid] =  @($pid_user_dict[$ppguid] | Sort-Object | Get-Unique)
+            } else {
+                $pid_user_dict[$ppguid] = @()
+                $pid_user_dict[$ppguid]+=$puser
+                $pid_user_dict[$ppguid] =  @($pid_user_dict[$ppguid] | Sort-Object | Get-Unique)
+            }
+            if ($pid_user_dict.ContainsKey($tpguid)) {
+                $pid_user_dict[$tpguid]+=$user
+                $pid_user_dict[$tpguid] =  @($pid_user_dict[$tpguid] | Sort-Object | Get-Unique)
+            } else {
+                $pid_user_dict[$tpguid] = @()
+                $pid_user_dict[$tpguid]+=$user
+                $pid_user_dict[$tpguid] =  @($pid_user_dict[$tpguid] | Sort-Object | Get-Unique)
+            }
+            if ($cli_dict.ContainsKey($tpguid)) {
+                $cli_dict[$tpguid]+=$cli
+                $cli_dict[$tpguid] =  @($cli_dict[$tpguid] | Sort-Object | Get-Unique)
+            } else {
+                $cli_dict[$tpguid] = @()
+                $cli_dict[$tpguid]+=$cli
+                $cli_dict[$tpguid] =  @($cli_dict[$tpguid] | Sort-Object | Get-Unique)
+            }
+            if ($cli_dict.ContainsKey($ppguid)) {
+                $cli_dict[$ppguid]+=$pcli
+                $cli_dict[$ppguid] =  @($cli_dict[$ppguid] | Sort-Object | Get-Unique)
+            } else {
+                $cli_dict[$ppguid] = @()
+                $cli_dict[$ppguid]+=$pcli
+                $cli_dict[$ppguid] =  @($cli_dict[$ppguid] | Sort-Object | Get-Unique)
+            }
+            if ($pname_dict.ContainsKey($tpguid)) {
+                $pname_dict[$tpguid]+=$pname
+                $pname_dict[$tpguid] =  @($pname_dict[$tpguid] | Sort-Object | Get-Unique)
+            } else {
+                $pname_dict[$tpguid] = @()
+                $pname_dict[$tpguid]+=$pname
+                $pname_dict[$tpguid] =  @($pname_dict[$tpguid] | Sort-Object | Get-Unique)
+            }
+            if ($pname_dict.ContainsKey($ppguid)) {
+                $pname_dict[$ppguid]+=$ppname
+                $pname_dict[$ppguid] =  @($pname_dict[$ppguid] | Sort-Object | Get-Unique)
+            } else {
+                $pname_dict[$ppguid] = @()
+                $pname_dict[$ppguid]+=$ppname
+                $pname_dict[$ppguid] =  @($pname_dict[$ppguid] | Sort-Object | Get-Unique)
             }
         } else {
-            $hashtable[$parent] = @()
-            $hashtable[$parent] += $child
+            if ($ptime -ne $null) {
+                if ($tpguid -ne $null ){
+                    if (!($pid_time.ContainsKey($tpguid))) {
+                        $pid_time[$tpguid] = $ptime
+                    }
+                }
+            }
+            if (($ppguid -ne $null) -and ($tpguid -ne $null)) {
+                if ($pid_dict.ContainsKey($ppguid)) {
+                    $pid_dict[$ppguid]+=$tpguid
+                    $pid_dict[$ppguid] =  @($pid_dict[$ppguid] | Sort-Object | Get-Unique)
+                } else {
+                    $pid_dict[$ppguid] = @()
+                    $pid_dict[$ppguid]+=$tpguid
+                    $pid_dict[$ppguid] =  @($pid_dict[$ppguid] | Sort-Object | Get-Unique)
+                }
+            }
+            if (($pname -ne $null) -and ($tpguid -ne $null)) {
+                if ($pname_dict.ContainsKey($tpguid)) {
+                    $pname_dict[$tpguid]+=$pname
+                    $pname_dict[$tpguid] =  @($pname_dict[$tpguid] | Sort-Object | Get-Unique)
+                } else {
+                    $pname_dict[$tpguid] = @()
+                    $pname_dict[$tpguid]+=$pname
+                    $pname_dict[$tpguid] =  @($pname_dict[$tpguid] | Sort-Object | Get-Unique)
+                }
+            }
+            if (($ppname -ne $null) -and ($ppguid -ne $null)) {
+                if ($pname_dict.ContainsKey($ppguid)) {
+                    $pname_dict[$ppguid]+=$ppname
+                    $pname_dict[$ppguid] =  @($pname_dict[$ppguid] | Sort-Object | Get-Unique)
+                } else {
+                    $pname_dict[$ppguid] = @()
+                    $pname_dict[$ppguid]+=$ppname
+                    $pname_dict[$ppguid] =  @($pname_dict[$ppguid] | Sort-Object | Get-Unique)
+                }
+            }
+        }
+        if ($type -eq "DNSEvent (DNS query)") {
+            if ($pid_dns.ContainsKey($tpguid)) {
+                $pid_dns[$tpguid]+=$domain_name
+                $pid_dns[$tpguid] =  @($pid_dns[$tpguid] | Sort-Object | Get-Unique)
+            } else {
+                $pid_dns[$tpguid] = @()
+                $pid_dns[$tpguid]+=$domain_name
+                $pid_dns[$tpguid] =  @($pid_dns[$tpguid] | Sort-Object | Get-Unique)
+            }
         }
     }
-    $Completed = ($i/$total) * 100
-    Write-Progress -Activity "Search in Progress" -Status "$i Out of $total Complete:" -PercentComplete $Completed
-}
 
-$noparents = @()
-foreach ($var in $vars) {
-    #does it exist as a child in any arrays?
-    $ppid = $var
-    $exist = "No"
-    foreach ($item in $vars) {
-        if ($hashtable[$item].Contains($ppid)) {
-            $exist = "Yes"
+
+    #find PID with no parent
+    $top_level = @()
+    foreach ($key in $pid_dict.Keys) {
+        $exist = $false
+        foreach ($tkey in $pid_dict.Keys) {
+            if ($pid_dict[$tkey].Contains($key)) {
+                $exist = $true
+            }
+        }
+        if (!($exist)) {
+            $top_level+=$key
         }
     }
-    if ($exist -eq "No") {
-        $noparents += $ppid
+    #list children keys
+    #find PID with no parent
+    $children_keys = @()
+    foreach ($key in $pid_dict.Keys) {
+        $children_keys+=$pid_dict[$key]
     }
-}
-
-#if no parent - these are child 2 and get linked to base name
-function Get-Child {
-    [CmdletBinding()]
-    param (
-        [Parameter(Mandatory)]
-        [string]$proc,
-        [Parameter(Mandatory)]
-        $level,
-        [Parameter(Mandatory)]
-        [string]$padding
-    )
-    $return_json = @()
-    $children = $hashtable[$proc]
-    if ($children.Count -gt 0) {
-        $level++
-        $json_level = 3938
-        $padding = " " + $padding
-        foreach ($child in $children) {
-            $cpid = ($child -Split " ")[0]
-            $cpname = ((($child -Split " ")[1] -Replace "\(","") -Replace "\)","").Trim()
-            $ppid = ($proc -Split " ")[0]
-            $pname = ((($proc -Split " ")[1] -Replace "\(","") -Replace "\)","").Trim()
-            if ($parent_pid.GetType().BaseType.Name -eq "Array") {
-                if ($parent_pid.Count -eq 2) {
-                    $1 = $parent_pid[0]
-                    $2 = $parent_pid[1]
-                    $temp_temp = $temp | Where-Object {($_.$1.$2 -eq $ppid)}
-                } elseif ($parent_pid.Count -eq 3) {
-                    $1 = $parent_pid[0]
-                    $2 = $parent_pid[1]
-                    $3 = $parent_pid[2]
-                    $temp_temp = $temp | Where-Object {($_.$1.$2.$3 -eq $ppid)}
-                }
-            } else {
-                $temp_temp = $temp | Where-Object {$_.$parent_pid -eq $ppid}
-            }
-            if ($parent_name.GetType().BaseType.Name -eq "Array") {
-                if ($parent_name.Count -eq 2) {
-                    $1 = $parent_name[0]
-                    $2 = $parent_name[1]
-                    $temp_temp = $temp_temp | Where-Object {($_.$1.$2 -eq $pname)}
-                } elseif ($parent_name.Count -eq 3) {
-                    $1 = $parent_name[0]
-                    $2 = $parent_name[1]
-                    $3 = $parent_name[2]
-                    $temp_temp = $temp_temp | Where-Object {($_.$1.$2.$3 -eq $pname)}
-                }
-            } else {
-                $temp_temp = $temp_temp | Where-Object {$_.$parent_name -eq $pname}
-            }
-            if ($child_pid.GetType().BaseType.Name -eq "Array") {
-                if ($child_pid.Count -eq 2) {
-                    $1 = $child_pid[0]
-                    $2 = $child_pid[1]
-                    $temp_temp = $temp_temp | Where-Object {($_.$1.$2 -eq $cpid)}
-                } elseif ($child_pid.Count -eq 3) {
-                    $1 = $child_pid[0]
-                    $2 = $child_pid[1]
-                    $3 = $child_pid[2]
-                    $temp_temp = $temp_temp | Where-Object {($_.$1.$2.$3 -eq $cpid)}
-                }
-            } else {
-                $temp_temp = $temp_temp | Where-Object {$_.$child_pid -eq $cpid}
-            }
-            if ($child_cli.GetType().BaseType.Name -eq "Array") {
-                if ($child_cli.Count -eq 2) {
-                    $1 = $child_cli[0]
-                    $2 = $child_cli[1]
-                    $clis = $temp_temp.$1.$2
-                } elseif ($child_cli.Count -eq 3) {
-                    $1 = $child_cli[0]
-                    $2 = $child_cli[1]
-                    $3 = $child_cli[2]
-                    $clis = $temp_temp.$1.$2.$3
-                }
-            } else {
-                $clis = $temp_temp.$child_cli
-            }
-            $clis = $clis | Sort-Object | Get-Unique
-            if ($child_start.GetType().BaseType.Name -eq "Array") {
-                if ($child_start.Count -eq 2) {
-                    $1 = $child_start[0]
-                    $2 = $child_start[1]
-                    $cstart = $temp_temp.$1.$2
-                } elseif ($child_start.Count -eq 3) {
-                    $1 = $child_start[0]
-                    $2 = $child_start[1]
-                    $3 = $child_start[2]
-                    $cstart = $temp_temp.$1.$2.$3
-                }
-            } else {
-                $cstart = $temp_temp.$child_start
-            }
-            if ($cstart.GetType().BaseType.Name -eq "Array") {
-                $cstart = $cstart[0]
-            }
-            $temp_temp = $null
-            foreach ($cli in $clis) {
-                $lcli = $null
+    $children_keys = $children_keys | Sort-Object | Get-Unique
+    #find interesting processes associated with Process Injections (to or from), with Connections, OR with External Domain Calls
+    foreach ($key in $pname_dict.Keys) {
+        if ($top_level -NotContains $key){
+            $exist = $false
+            if ($pid_connect[$key] -ne $null) {
+                $exist = $true
+            } 
+            if ($pid_dns[$key] -ne $null) {
                 $add = $false
-                $lcli = $cli
-                $cli = $cli[0..125] -Join ""
-                if ($cli.Length -ge 125) {
-                    $add = $true
-                    $cli = $cli + "..."
+                $domains = $pid_connect[$key] 
+                foreach ($d in $domains) {
+                    if (($d -like "*\.*") -and (($d -notlike "*local") -or ($d -notlike "*int") -or ($d -notlike "*pvt"))) {
+                        $add = $true
+                    }
                 }
-                $cli_level = 3938
-                $cli = $cli -Replace '"',''
-                $cli = $cli -Replace '\\','|'
-                $lcli = $lcli -Replace '"',''
-                $lcli = $lcli -Replace '\\','|'
-                $item = "CLI - " + $cli
-                $output = New-Object -TypeName PSObject
-                $output | Add-Member -MemberType NoteProperty -Name "name" -Value $item
                 if ($add) {
-                    $output | Add-Member -MemberType NoteProperty -Name "cstart" -Value $lcli
+                    
+                    $exist = $true
                 }
-                $output | Add-Member -MemberType NoteProperty -Name "size" -Value $cli_level
-                $return_json += $output | ConvertTo-Json
             }
-
+            if ($xprocess_dict[$key] -ne $null) {
+                $exist = $true
+            }
+            
+            if ($exist) {
+                if ($children_keys -notcontains $key) {
+                    $top_level+=$key
+                }
+            }
+        }
+    }
+    $top_level = $top_level | Sort-Object | Get-Unique
+    foreach ($xkey in $xprocess_dict.Keys) {
+        foreach ($value in $xprocess_dict[$xkey]) {
+            if ($top_level -NotContains $value) {
+                $add = $true
+                foreach ($key in $pid_dict.Keys) {
+                    if ($pid_dict[$key] -Contains $value) {
+                        $add = $false
+                    }
+                }
+                if ($add) {
+                    if ($children_keys -notcontains $key) {
+                        $top_level+=$value
+                    }
+                }
+            }
+        }
+    }
+    $top_level = $top_level | Sort-Object | Get-Unique
+    function build_process($tpid){
+        $children = @()
+        $children_process = $pid_dict[$tpid]
+        $pname = $null
+        $puser = $null
+        $phash = $null
+        $cli = $null
+        $ptime = $null
+        $files = $null
+        $connections = $null
+        $queries = $null
+        $rules = $null
+        $process_injections = $null
+        if ($pname_dict[$tpid] -eq $null) {
+            $pname = "Unknown"
+        } else {
+            $pname = $pname_dict[$tpid] | Out-string
+        }
+        if ($pid_user_dict[$tpid] -eq $null) {
+            $puser = "Unknown"
+        } else {
+            $puser = $pid_user_dict[$tpid] | Out-string
+        }
+        if ($hashes_dict[$tpid] -eq $null) {
+            $phash = "Unknown"
+        } else {
+            $phash = $hashes_dict[$tpid] | Out-string
+        }
+        if ($cli_dict[$tpid] -eq $null) {
+            $cli = "Unknown"
+        } else {
+            $cli = $cli_dict[$tpid] | Out-string
+        }
+        $cli = $cli -Replace "Parent",""
+        if ($pid_time[$tpid] -eq $null) {
+            $ptime = "Unknown"
+        } else {
+            $ptime = $pid_time[$tpid] | Out-string
+        }
+        if (!(($cli -eq "Unknown") -and ($puser -eq "Unknown") -and ($pname -eq "Unknown") -and ($children_process.Count -eq 0))) {
+            if ($pid_create[$tpid] -eq $null) {
+                $files = @()
+            } else {
+                $files = $pid_create[$tpid]
+            }
+            if ($pid_connect[$tpid] -eq $null) {
+                $connections = @()
+            } else {
+                $connections = $pid_connect[$tpid]
+            }
+            if ($pid_dns[$tpid] -eq $null) {
+                $queries = @()
+            } else {
+                $queries = $pid_dns[$tpid]
+            }
+            if ($rules_dict[$tpid] -eq $null) {
+                $rules = @()
+            } else {
+                $rules = $rules_dict[$tpid]
+            }
+            if ($xprocess_dict[$tpid] -eq $null) {
+                $process_injections = @()
+            } else {
+                $temp_injections = $xprocess_dict[$tpid]
+                $process_injections = @()
+                foreach ($inj in $temp_injections) {
+                    $tname = $pname_dict[$inj] | out-string
+                    $t_inj = $tname + " - " + $inj
+                    $process_injections+=$t_inj
+                }
+            }
+            #build Child Processes
+            foreach ($cprocess in $children_process) {
+                $children+=build_process $cprocess
+            }
+            #check $pid_dict for children.....
             $output = New-Object -TypeName PSObject
-            $output | Add-Member -MemberType NoteProperty -Name "name" -Value $child
-            $output | Add-Member -MemberType NoteProperty -Name "size" -Value $json_level
-            if ($cstart -ne "") {
-                $output | Add-Member -MemberType NoteProperty -Name "cstart" -Value $cstart
+            $output | Add-Member -MemberType NoteProperty -Name "name" -Value $pname
+            $output | Add-Member -MemberType NoteProperty -Name "pid" -Value $tpid
+            $output | Add-Member -MemberType NoteProperty -Name "sha256" -Value $phash
+            $output | Add-Member -MemberType NoteProperty -Name "creation_time" -Value $ptime
+            $output | Add-Member -MemberType NoteProperty -Name "user" -Value $puser
+            $output | Add-Member -MemberType NoteProperty -Name "commandline" -Value $cli
+            $output | Add-Member -MemberType NoteProperty -Name "files_created" -Value $files
+            $output | Add-Member -MemberType NoteProperty -Name "network_connections" -Value $connections
+            $output | Add-Member -MemberType NoteProperty -Name "dns_queries" -Value $queries
+            $output | Add-Member -MemberType NoteProperty -Name "sysmon_rules" -Value $rules
+            $output | Add-Member -MemberType NoteProperty -Name "process_injections" -Value $process_injections
+            $output | Add-Member -MemberType NoteProperty -Name "children" -Value $children
+            if ($pname.ToUpper() -notlike "*UPDATER.EXE*"){
+                return $output
             }
-            $cchildren = $null
-            $cchildren = Get-Child -proc $child -padding $padding -level $level
-            if ($cchildren) {
-                $output | Add-Member -MemberType NoteProperty -Name "children" -Value $cchildren
-            }
-            $return_json += $output | ConvertTo-Json
         }
-
     }
-    if ($return_json.Count -gt 0) {
-        $return_json = $return_json | Sort-Object | Get-Unique
-        $final_children = "[" + ($return_json -Join ",") + "]"
-        $return  = $final_children
-    } else {
-        $return = $null
-    }
-    return $return
 
+    $json = New-Object -TypeName PSObject
+    $json | Add-Member -MemberType NoteProperty -Name "name" -Value "root"
+    $json | Add-Member -MemberType NoteProperty -Name "pid" -Value 0
+    $json | Add-Member -MemberType NoteProperty -Name "sha256" -Value @()
+    $json | Add-Member -MemberType NoteProperty -Name "user" -Value "SYSTEM"
+    $json | Add-Member -MemberType NoteProperty -Name "commandline" -Value "SYSTEM PROCESS"
+    $json | Add-Member -MemberType NoteProperty -Name "files_created" -Value @()
+    $json | Add-Member -MemberType NoteProperty -Name "network_connections" -Value @()
+    $json | Add-Member -MemberType NoteProperty -Name "dns_queries" -Value @()
+    $json | Add-Member -MemberType NoteProperty -Name "sysmon_rules" -Value @()
+    $json | Add-Member -MemberType NoteProperty -Name "process_injections" -Value @()
+    $json | Add-Member -MemberType NoteProperty -Name "children" -Value @()
+    foreach ($key in $top_level) {
+        $json.children+= build_process $key
+    }
+    $ofile = $file_path + "\" + $system_name + ".json"
+    Write-Host "## Writing output to $ofile"
+    $json | ConvertTo-Json -Depth 100 | Out-File $ofile
 }
-
-
-
-#for each of these iterate trhough childdren and create sub levels
-$total = $noparents.Count
-$i = 0
-$json = @()
-foreach ($proc in $noparents) {
-    $i++
-    $Completed = ($i/$total) * 100
-    Write-Progress -Activity "Search in Progress" -Status "$i Out of $total Complete:" -PercentComplete $Completed
-    $ppid = ($proc -Split " ")[0]
-    $pname = ((($proc -Split " ")[1] -Replace "\(","") -Replace "\)","").Trim()
-    if ($parent_pid.GetType().BaseType.Name -eq "Array") {
-        if ($parent_pid.Count -eq 2) {
-            $1 = $parent_pid[0]
-            $2 = $parent_pid[1]
-            $temp_temp = $temp | Where-Object {($_.$1.$2 -eq $ppid)}
-        } elseif ($parent_pid.Count -eq 3) {
-            $1 = $parent_pid[0]
-            $2 = $parent_pid[1]
-            $3 = $parent_pid[2]
-            $temp_temp = $temp | Where-Object {($_.$1.$2.$3 -eq $ppid)}
-        }
-    } else {
-        $temp_temp = $temp | Where-Object {$_.$parent_pid -eq $ppid}
-    }
-    if ($parent_name.GetType().BaseType.Name -eq "Array") {
-        if ($parent_name.Count -eq 2) {
-            $1 = $parent_name[0]
-            $2 = $parent_name[1]
-            $temp_temp = $temp_temp | Where-Object {($_.$1.$2 -eq $pname)}
-        } elseif ($parent_pid.Count -eq 3) {
-            $1 = $parent_name[0]
-            $2 = $parent_name[1]
-            $3 = $parent_name[2]
-            $temp_temp = $temp_temp | Where-Object {($_.$1.$2.$3 -eq $pname)}
-        }
-    } else {
-        $temp_temp = $temp_temp | Where-Object {$_.$parent_name -eq $pname}
-    }
-    if ($parent_start.GetType().BaseType.Name -eq "Array") {
-        if ($parent_start.Count -eq 2) {
-            $1 = $parent_start[0]
-            $2 = $parent_start[1]
-            $pstart = $temp_temp.$1.$2
-        } elseif ($parent_start.Count -eq 3) {
-            $1 = $parent_start[0]
-            $2 = $parent_start[1]
-            $3 = $parent_start[2]
-            $pstart = $temp_temp.$1.$2.$3
-        }
-    } else {
-        $pstart = $temp_temp.$parent_start
-    }
-    $temp_temp = $null
-    if ($pstart) {
-        if ($pstart.GetType().BaseType.Name -eq "Array") {
-            $pstart = $pstart[0]
-        }
-    } else {
-        $pstart = "NA"
-    }
-    $level = 2
-    $json_level = 3838
-    $padding = "-"
-    #Write-Host "$padding $proc"
-    $output = New-Object -TypeName PSObject
-    $output | Add-Member -MemberType NoteProperty -Name "name" -Value $proc
-    try {
-        $output | Add-Member -MemberType NoteProperty -Name "cstart" -Value $pstart
-    } catch {
-        $proc
-    }
-    $output | Add-Member -MemberType NoteProperty -Name "size" -Value $json_level
-    try {
-        $pchildren = Get-Child -proc $proc -padding $padding -level $level
-    }catch {
-        $proc
-    }
-    if ($pchildren.Count -gt 0) {
-        $output | Add-Member -MemberType NoteProperty -Name "children" -Value $pchildren
-    }
-    $json += $output
-}
-$t =$json | ConvertTo-Json -Depth 100 -Compress
-$t = $t -Replace "\\n",""
-$t = $t -Replace "\\",""
-$t = $t -Replace '"\[','['
-$t = $t -Replace '\]"',']'
-$t = $t -Replace "\|","\\"
-$t = '{"children":' + $t
-$t = $t + ',"name":"' + $Computer + '","size":3938}'
-$t | out-File $outfile
-Write-Host "Output written to $outfile"
