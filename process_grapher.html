@@ -1,0 +1,899 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Process Tree Viewer</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+            background-color: #f5f5f5;
+            overflow: hidden;
+        }
+        
+        .upload-container {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            text-align: center;
+            padding: 10px;
+            background-color: white;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            z-index: 1000;
+        }
+
+        .tree-container {
+            position: fixed;
+            top: 60px;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: white;
+            overflow: hidden;
+        }
+
+        .node {
+            cursor: pointer;
+        }
+
+        .node circle {
+            fill: #fff;
+            stroke: steelblue;
+            stroke-width: 2px;
+        }
+
+        .node text {
+            font: 12px sans-serif;
+            paint-order: stroke;
+            stroke: white;
+            stroke-width: 3px;
+            stroke-linecap: butt;
+            stroke-linejoin: miter;
+        }
+
+        .link {
+            fill: none;
+            stroke: #ccc;
+            stroke-width: 1px;
+        }
+
+        .info-panel {
+            position: absolute;
+            width: 300px;
+            background-color: white;
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            display: none;
+            max-height: 400px;
+            overflow-y: auto;
+            z-index: 1000;
+        }
+
+        .info-title {
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+
+        .info-content {
+            font-size: 12px;
+        }
+
+        .info-section {
+            margin-bottom: 10px;
+        }
+
+        .info-section-title {
+            font-weight: bold;
+            color: #666;
+        }
+
+        .controls {
+            position: fixed;
+            bottom: 20px;
+            left: 20px;
+            z-index: 1000;
+            background-color: white;
+            padding: 10px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        button {
+            padding: 8px 16px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            margin: 0 5px;
+        }
+
+        button:hover {
+            background-color: #45a049;
+        }
+
+        .zoom-info {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background-color: rgba(255, 255, 255, 0.8);
+            padding: 5px 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            z-index: 1000;
+        }
+
+        .connection-controls {
+            position: fixed;
+            bottom: 70px;
+            left: 20px;
+            z-index: 1000;
+            background-color: white;
+            padding: 10px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+
+        .connection-line {
+		    stroke: #ff0000;
+		    stroke-width: 1.5px;
+		    stroke-dasharray: 4,4;
+		    fill: none;
+		    pointer-events: none;
+		    opacity: 0.7;
+		    filter: drop-shadow(0px 0px 1px rgba(255,255,255,0.9));
+		}
+
+        .connection-mode {
+            background-color: #ffebee;
+            border: 2px solid #f44336;
+            padding: 5px 10px;
+            border-radius: 4px;
+            position: fixed;
+            top: 70px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 1000;
+            display: none;
+            font-weight: bold;
+            color: #f44336;
+        }
+
+        .clear-button {
+            background-color: #f44336;
+        }
+
+        .clear-button:hover {
+            background-color: #d32f2f;
+        }
+
+        .malicious-toggle {
+            margin-top: 10px;
+            padding: 5px 10px;
+            background-color: #f44336;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            width: 100%;
+        }
+
+        .malicious-toggle:hover {
+            background-color: #d32f2f;
+        }
+
+        .process-name {
+            cursor: pointer;
+        }
+
+        .status-malicious {
+            color: #f44336;
+            font-weight: bold;
+        }
+        
+        .upload-container button {
+            margin-left: 10px;
+        }
+
+        .collapsible {
+            cursor: pointer;
+        }
+
+        .has-children {
+            font-weight: bold;
+        }
+
+        .hash-text {
+            font-family: monospace;
+            word-break: break-all;
+        }
+    </style>
+</head>
+<body>
+    <div class="upload-container">
+        <input type="file" id="fileInput" accept=".json">
+        <button onclick="loadSampleData()">Load Sample Data</button>
+        <button onclick="centerView()">Reset View</button>
+        <button onclick="exportVisualization()">Export as SVG</button>
+    </div>
+    <div class="tree-container" id="treeContainer"></div>
+    <div class="info-panel" id="infoPanel">
+        <div class="info-title">Process Information</div>
+        <div class="info-content" id="infoPanelContent"></div>
+    </div>
+    <div class="connection-mode" id="connectionMode">
+        Connection Mode: Select two nodes to connect
+    </div>
+    <div class="connection-controls">
+        <button onclick="clearLastConnection()" class="clear-button">Clear Last Connection</button>
+        <button onclick="clearAllConnections()" class="clear-button">Clear All Connections</button>
+    </div>
+    <div class="controls">
+        <button onclick="zoomIn()">+</button>
+        <button onclick="zoomOut()">-</button>
+    </div>
+    <div class="zoom-info">
+        Tip: Use mouse wheel to zoom, drag to pan
+    </div>
+    <script>
+    let treeData = null;
+    let svg, g;
+    let zoom;
+    let connectionMode = false;
+    let firstNode = null;
+    let connections = [];
+    
+    function exportVisualization() {
+        const svgElement = document.querySelector('#treeContainer svg');
+        const svgCopy = svgElement.cloneNode(true);
+        const transform = g.attr('transform');
+        const bbox = g.node().getBBox();
+        const currentTransform = d3.zoomTransform(g.node());
+        
+        svgCopy.setAttribute('width', bbox.width);
+        svgCopy.setAttribute('height', bbox.height);
+        svgCopy.setAttribute('viewBox', `${bbox.x} ${bbox.y} ${bbox.width} ${bbox.height}`);
+        
+        const gCopy = svgCopy.querySelector('g');
+        gCopy.setAttribute('transform', transform);
+        
+        const serializer = new XMLSerializer();
+        let source = serializer.serializeToString(svgCopy);
+        source = '<?xml version="1.0" standalone="no"?>\r\n' + source;
+        
+        const blob = new Blob([source], {type: 'image/svg+xml;charset=utf-8'});
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(blob);
+        link.download = 'process_tree.svg';
+        
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+    }
+
+    function initializeZoom() {
+        zoom = d3.zoom()
+            .scaleExtent([0.1, 4])
+            .on('zoom', (event) => {
+                g.attr('transform', event.transform);
+            });
+        
+        svg.call(zoom);
+    }
+
+    function zoomIn() {
+        svg.transition()
+            .duration(300)
+            .call(zoom.scaleBy, 1.5);
+    }
+
+    function zoomOut() {
+        svg.transition()
+            .duration(300)
+            .call(zoom.scaleBy, 0.667);
+    }
+
+    function centerView() {
+        if (!g) return;
+        
+        const bounds = g.node().getBBox();
+        const parent = svg.node().parentElement;
+        const width = parent.clientWidth;
+        const height = parent.clientHeight;
+        const scale = 0.95 / Math.max(bounds.width / width, bounds.height / height);
+        const translate = [
+            (width - bounds.width * scale) / 2 - bounds.x * scale,
+            (height - bounds.height * scale) / 2 - bounds.y * scale
+        ];
+
+        const transform = d3.zoomIdentity.translate(translate[0], translate[1]).scale(scale);
+        
+        svg.transition()
+            .duration(750)
+            .call(zoom.transform, transform);
+    }
+
+    function preprocessData(data, level = 0) {
+        if (!data) return data;
+        
+        if (!data.children) {
+            data.children = [];
+        }
+        else if (!Array.isArray(data.children)) {
+            data.children = [];
+        }
+        
+        data.children = data.children.map(child => preprocessData(child, level + 1));
+        
+        return data;
+    }
+
+    function createTree(data, isInitial = true) {
+        if (isInitial) {
+            data = preprocessData(JSON.parse(JSON.stringify(data)));
+            treeData = data;
+            
+            d3.select('#treeContainer').select('svg').remove();
+
+            const container = document.getElementById('treeContainer');
+            svg = d3.select('#treeContainer')
+                .append('svg')
+                .attr('width', '100%')
+                .attr('height', '100%');
+
+            g = svg.append('g');
+            initializeZoom();
+        }
+
+        const currentTransform = g ? d3.zoomTransform(g.node()) : null;
+
+        updateTree(treeData);
+
+        if (isInitial) {
+            centerView();
+        } else if (currentTransform) {
+            g.attr('transform', currentTransform);
+        }
+
+        if (!isInitial) {
+            drawConnections();
+        }
+    }
+
+    function handleConnectionMode(event, d) {
+        if (!firstNode) {
+            firstNode = d;
+            document.getElementById('connectionMode').innerHTML = 'Select second node to complete connection';
+        } else {
+            if (firstNode !== d) {
+                createConnection(firstNode, d);
+            }
+            firstNode = null;
+            document.getElementById('connectionMode').style.display = 'none';
+            document.getElementById('connectionMode').innerHTML = 'Connection Mode: Select two nodes to connect';
+        }
+    }
+
+function createConnection(source, target) {
+    // Check if connection already exists
+    const exists = connections.some(conn => 
+        (conn.source === source && conn.target === target) ||
+        (conn.source === target && conn.target === source)
+    );
+    
+    if (!exists) {
+        const connection = {
+            source: source,
+            target: target,
+            id: `conn_${connections.length}`
+        };
+        connections.push(connection);
+        drawConnections();
+    }
+}
+
+function drawConnections() {
+    g.selectAll('.connection-line').remove();
+    
+    connections.forEach((conn, index) => {
+        const sourceX = conn.source.y;
+        const sourceY = conn.source.x;
+        const targetX = conn.target.y;
+        const targetY = conn.target.x;
+        
+        // Calculate a simple midpoint that's offset perpendicular to the line
+        const mpX = (sourceX + targetX) / 2;
+        const mpY = (sourceY + targetY) / 2;
+        
+        // Calculate the perpendicular offset
+        const dx = targetX - sourceX;
+        const dy = targetY - sourceY;
+        const len = Math.sqrt(dx * dx + dy * dy);
+        
+        // Create a significant offset (100px) perpendicular to the line
+        const offsetX = -dy / len * 100;
+        const offsetY = dx / len * 100;
+        
+        // Create the control point with the offset
+        const ctrlX = mpX + offsetX;
+        const ctrlY = mpY + offsetY;
+        
+        // Create quadratic curve path
+        const path = `M ${sourceX} ${sourceY} Q ${ctrlX} ${ctrlY} ${targetX} ${targetY}`;
+        
+        g.append('path')
+            .attr('class', 'connection-line')
+            .attr('d', path)
+            .attr('id', conn.id);
+    });
+}
+
+	
+	function clearLastConnection() {
+	    if (connections.length > 0) {
+	        connections.pop();
+	        drawConnections();
+	    }
+	}
+	
+	function clearAllConnections() {
+	    connections = [];
+	    g.selectAll('.connection-line').remove();
+	}
+
+
+    document.addEventListener('keydown', function(event) {
+        if (event.ctrlKey && event.altKey) {
+            connectionMode = true;
+            document.getElementById('connectionMode').style.display = 'block';
+        }
+    });
+
+    document.addEventListener('keyup', function(event) {
+        if (!event.ctrlKey || !event.altKey) {
+            connectionMode = false;
+            if (!firstNode) {
+                document.getElementById('connectionMode').style.display = 'none';
+            }
+        }
+    });
+	</script>
+	<script>
+    function updateTree(source) {
+        const tree = d3.tree().nodeSize([40, 180]);
+        const root = d3.hierarchy(source);
+        
+        tree(root);
+
+        const nodes = root.descendants();
+        const links = root.links();
+
+        nodes.forEach(d => d.y = d.depth * 180);
+
+        const link = g.selectAll('path.link')
+            .data(links, d => d.target.id || (d.target.id = Math.random()));
+
+        link.enter()
+            .insert('path', 'g')
+            .attr('class', 'link')
+            .attr('d', d3.linkHorizontal()
+                .x(d => d.y)
+                .y(d => d.x));
+
+        link.exit().remove();
+
+        link.attr('d', d3.linkHorizontal()
+            .x(d => d.y)
+            .y(d => d.x));
+
+        const node = g.selectAll('g.node')
+            .data(nodes, d => d.id || (d.id = Math.random()));
+
+        const nodeEnter = node.enter()
+            .append('g')
+            .attr('class', 'node')
+            .attr('transform', d => `translate(${d.y},${d.x})`);
+
+        nodeEnter.append('circle')
+            .attr('r', 6)
+            .style('fill', d => {
+                if (d.data.malicious) return '#ff0000';
+                return d.data.user === 'SYSTEM' ? '#ff9999' : '#99ff99';
+            })
+            .style('stroke', d => {
+                if (d.data.malicious) return '#990000';
+                return d.data.user === 'SYSTEM' ? '#ff0000' : '#00ff00';
+            })
+            .on('click', function(event, d) {
+                event.stopPropagation();
+                if (connectionMode) {
+                    handleConnectionMode(event, d);
+                } else {
+                    if (d.children) {
+                        d.data._children = d.data.children;
+                        d.data.children = null;
+                    } else if (d.data._children) {
+                        d.data.children = d.data._children;
+                        d.data._children = null;
+                    }
+                    updateTree(treeData);
+                }
+            });
+
+        nodeEnter.append('text')
+            .attr('dy', '0.31em')
+            .attr('x', d => d.children || d.data._children ? -12 : 12)
+            .attr('text-anchor', d => d.children || d.data._children ? 'end' : 'start')
+            .attr('class', 'process-name')
+            .text(d => {
+                let text = d.data.name;
+                if (d.data._children) text += ' +';
+                return text;
+            })
+            .on('click', function(event, d) {
+                event.stopPropagation();
+                showProcessInfo(event, d.data);
+            })
+            .clone(true).lower()
+            .attr('stroke-linejoin', 'round')
+            .attr('stroke-width', 3)
+            .attr('stroke', 'white');
+
+nodeEnter.each(function(d) {
+    const node = d3.select(this);
+    const badges = node.append("g")
+        .attr("class", "badges")
+        .attr("transform", "translate(0, 20)");
+
+    let xPosition = 0;
+    const spacing = 20;
+
+    // Only add network badge if connections exist
+    if (d.data.network_connections.length > 0) {
+        badges.append("path")
+            .attr("d", "M2 2h12v12H2V2zm2 2v8h2V4H4zm3 0v8h2V4H7zm3 0v8h2V4h-2zm-7 9h10v1H3v-1z")
+            .attr("transform", `translate(${xPosition-8}, -8) scale(0.8)`)
+            .attr("fill", "#ff6b6b")
+            .append("title")
+            .text(`Network Connections: ${d.data.network_connections.length}`);
+        xPosition += spacing;
+    }
+
+    // Only add DNS badge if queries exist
+    if (d.data.dns_queries.length > 0) {
+        badges.append("path")
+            .attr("d", "M15.5 14.5l-3.5-3.5C13.3 10.1 14 8.6 14 7c0-3.9-3.1-7-7-7S0 3.1 0 7s3.1 7 7 7c1.6 0 3.1-.7 4-1.7l3.5 3.5 1-1zM2 7c0-2.8 2.2-5 5-5s5 2.2 5 5-2.2 5-5 5-5-2.2-5-5z")
+            .attr("transform", `translate(${xPosition-8}, -8) scale(0.8)`)
+            .attr("fill", "#4ecdc4")
+            .text(`DNS Queries: ${d.data.dns_queries.length}`);
+        xPosition += spacing;
+    }
+
+    // Only add injection badge if injections exist
+    if (d.data.process_injections.length > 0) {
+        badges.append("path")
+            .attr("d", "M7.5,0L0,9h6l-1.5,7L12,7H6l1.5-7z")
+            .attr("transform", `translate(${xPosition-8}, -8) scale(0.8)`)
+            .attr("fill", "#ffd93d")
+            .append("title")
+            .text(`Process Injections: ${d.data.process_injections.length}`);
+        xPosition += spacing;
+    }
+
+    // Only add file badge if files exist
+    if (d.data.files_created.length > 0) {
+        badges.append("path")
+            .attr("d", "M9 0H3c-.6 0-1 .4-1 1v14c0 .6.4 1 1 1h10c.6 0 1-.4 1-1V4L9 0zM12 14H4V2h4v3h4v9z")
+            .attr("transform", `translate(${xPosition-8}, -8) scale(0.8)`)
+            .attr("fill", "#95a5a6")
+            .append("title")
+            .text(`Files Created: ${d.data.files_created.length}`);
+    }
+});
+		const nodeUpdate = nodeEnter.merge(node)
+	        .transition()
+	        .duration(750)
+	        .attr("transform", d => `translate(${d.y},${d.x})`);
+
+
+        node.exit().remove();
+        node.attr('transform', d => `translate(${d.y},${d.x})`);
+		drawConnections();
+    }
+
+    function showProcessInfo(event, process) {
+        const infoPanel = document.getElementById('infoPanel');
+        const content = document.getElementById('infoPanelContent');
+        
+        if (event) {
+            const padding = 20;
+            const panelWidth = 300;
+            let leftPos = event.pageX + padding;
+            
+            if (leftPos + panelWidth > window.innerWidth) {
+                leftPos = event.pageX - panelWidth - padding;
+            }
+            
+            infoPanel.style.left = `${leftPos}px`;
+            infoPanel.style.top = `${event.pageY}px`;
+        }
+        
+        let html = `
+            <div class="info-section">
+                <div class="info-section-title">Basic Info</div>
+                <div>Process Name: ${process.name || 'Unknown'}</div>
+                <div>User: ${process.user || 'N/A'}</div>
+                <div>PID: ${process.pid || 'N/A'}</div>
+                <div>SHA256: <span class="hash-text">${process.sha256 || 'N/A'}</span></div>
+                <div>Created: ${process.creation_time || 'N/A'}</div>
+                <div>Status: <span class="${process.malicious ? 'status-malicious' : ''}">${process.malicious ? 'MALICIOUS' : 'Normal'}</span></div>
+                <button onclick="toggleMaliciousStatus(event, '${process.pid}')" class="malicious-toggle">
+                    ${process.malicious ? 'Mark as Normal' : 'Mark as Malicious'}
+                </button>
+            </div>
+        `;
+
+        if (process.commandline) {
+            html += `
+                <div class="info-section">
+                    <div class="info-section-title">Command Line</div>
+                    <div>${process.commandline}</div>
+                </div>
+            `;
+        }
+
+        if (process.files_created && process.files_created.length > 0) {
+            html += `
+                <div class="info-section">
+                    <div class="info-section-title">Files Created</div>
+                    <ul>
+                        ${process.files_created.map(file => `<li>${file}</li>`).join('')}
+                    </ul>
+                </div>
+            `;
+        }
+
+        if (process.network_connections && process.network_connections.length > 0) {
+            html += `
+                <div class="info-section">
+                    <div class="info-section-title">Network Connections</div>
+                    <ul>
+                        ${process.network_connections.map(conn => `<li>${conn}</li>`).join('')}
+                    </ul>
+                </div>
+            `;
+        }
+
+        if (process.dns_queries && process.dns_queries.length > 0) {
+            html += `
+                <div class="info-section">
+                    <div class="info-section-title">DNS Queries</div>
+                    <ul>
+                        ${process.dns_queries.map(query => `<li>${query}</li>`).join('')}
+                    </ul>
+                </div>
+            `;
+        }
+
+        if (process.sysmon_rules && process.sysmon_rules.length > 0) {
+            html += `
+                <div class="info-section">
+                    <div class="info-section-title">Sysmon Rules/Techniques</div>
+                    <ul>
+                        ${process.sysmon_rules.map(rule => `<li>${rule}</li>`).join('')}
+                    </ul>
+                </div>
+            `;
+        }
+
+        if (process.process_injections && process.process_injections.length > 0) {
+            html += `
+                <div class="info-section">
+                    <div class="info-section-title">Process Injections</div>
+                    <ul>
+                        ${process.process_injections.map(injection => `<li>${injection}</li>`).join('')}
+                    </ul>
+                </div>
+            `;
+        }
+
+        content.innerHTML = html;
+        infoPanel.style.display = 'block';
+    }
+
+    function toggleMaliciousStatus(event, pid) {
+        event.stopPropagation();
+        
+        function findAndToggleProcess(node, newStatus = null) {
+            if (node.pid === pid) {
+                node.malicious = newStatus !== null ? newStatus : !node.malicious;
+                const status = node.malicious;
+                
+                function markChildren(n) {
+                    if (n.children) {
+                        n.children.forEach(child => {
+                            child.malicious = status;
+                            markChildren(child);
+                        });
+                    }
+                    if (n._children) {
+                        n._children.forEach(child => {
+                            child.malicious = status;
+                            markChildren(child);
+                        });
+                    }
+                }
+                
+                markChildren(node);
+                return true;
+            }
+            if (node.children) {
+                for (let child of node.children) {
+                    if (findAndToggleProcess(child, newStatus)) return true;
+                }
+            }
+            if (node._children) {
+                for (let child of node._children) {
+                    if (findAndToggleProcess(child, newStatus)) return true;
+                }
+            }
+            return false;
+        }
+        
+        findAndToggleProcess(treeData);
+        updateTree(treeData);
+        
+        const process = findProcessByPid(treeData, pid);
+        if (process) {
+            showProcessInfo(event, process);
+        }
+    }
+
+    function findProcessByPid(node, pid) {
+        if (node.pid === pid) return node;
+        if (node.children) {
+            for (let child of node.children) {
+                const found = findProcessByPid(child, pid);
+                if (found) return found;
+            }
+        }
+        if (node._children) {
+            for (let child of node._children) {
+                const found = findProcessByPid(child, pid);
+                if (found) return found;
+            }
+        }
+        return null;
+    }
+
+    document.body.addEventListener('click', function(event) {
+        const infoPanel = document.getElementById('infoPanel');
+        if (!event.target.closest('.process-name') && 
+            !event.target.closest('.info-panel') && 
+            !event.target.closest('.malicious-toggle')) {
+            infoPanel.style.display = 'none';
+        }
+    });
+
+    // Load sample data
+    function loadSampleData() {
+        const sampleData = {
+            "name": "System",
+            "pid": "00000000-0000-0000-0000-000000000001",
+            "user": "SYSTEM",
+            "creation_time": "2024-02-15T08:00:00.000Z",
+            "commandline": "System Process",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "files_created": [],
+            "network_connections": [],
+            "dns_queries": [],
+            "sysmon_rules": ["T1002 - Data Compressed"],
+            "process_injections": [],
+            "children": [
+                {
+                    "name": "smss.exe",
+                    "pid": "00000000-0000-0000-0000-000000000002",
+                    "user": "SYSTEM",
+                    "creation_time": "2024-02-15T08:00:05.234Z",
+                    "commandline": "\\SystemRoot\\System32\\smss.exe",
+                    "sha256": "a7ab0f6b2c9f13d693bf6be623a78a4f89613bb0bbb85b54e2a4b534843a5156",
+                    "files_created": [
+                        "C:\\Windows\\System32\\smss.exe"
+                    ],
+                    "network_connections": [],
+                    "dns_queries": [],
+                    "sysmon_rules": ["T1003 - Credential Dumping"],
+                    "process_injections": [],
+                    "children": [
+                        {
+                            "name": "csrss.exe",
+                            "pid": "00000000-0000-0000-0000-000000000003",
+                            "user": "SYSTEM",
+                            "creation_time": "2024-02-15T08:00:06.123Z",
+                            "commandline": "C:\\Windows\\System32\\csrss.exe",
+                            "sha256": "b7ab0f6b2c9f13d693bf6be623a78a4f89613bb0bbb85b54e2a4b534843a5156",
+                            "files_created": [
+                                "C:\\Windows\\System32\\csrss.exe"
+                            ],
+                            "network_connections": [],
+                            "dns_queries": [],
+                            "sysmon_rules": [],
+                            "process_injections": ["notepad.exe"],
+                            "children": []
+                        },
+                        {
+                            "name": "wininit.exe",
+                            "pid": "00000000-0000-0000-0000-000000000004",
+                            "user": "SYSTEM",
+                            "creation_time": "2024-02-15T08:00:06.345Z",
+                            "commandline": "wininit.exe",
+                            "sha256": "c7ab0f6b2c9f13d693bf6be623a78a4f89613bb0bbb85b54e2a4b534843a5156",
+                            "files_created": [
+                                "C:\\Windows\\System32\\wininit.exe"
+                            ],
+                            "network_connections": [],
+                            "dns_queries": [],
+                            "sysmon_rules": ["T1055 - Process Injection"],
+                            "process_injections": ["explorer.exe", "svchost.exe"],
+                            "children": [
+                                {
+                                    "name": "services.exe",
+                                    "pid": "00000000-0000-0000-0000-000000000005",
+                                    "user": "SYSTEM",
+                                    "creation_time": "2024-02-15T08:00:07.567Z",
+                                    "commandline": "C:\\Windows\\System32\\services.exe",
+                                    "sha256": "d7ab0f6b2c9f13d693bf6be623a78a4f89613bb0bbb85b54e2a4b534843a5156",
+                                    "files_created": [],
+                                    "network_connections": [],
+                                    "dns_queries": [],
+                                    "sysmon_rules": [],
+                                    "process_injections": [],
+                                    "children": []
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        };
+        
+        createTree(sampleData);
+    }
+
+    document.getElementById('fileInput').addEventListener('change', function(e) {
+        const file = e.target.files[0];
+        const reader = new FileReader();
+        
+        reader.onload = function(event) {
+            try {
+                const data = JSON.parse(event.target.result);
+                createTree(data);
+            } catch (error) {
+                alert('Error parsing JSON file: ' + error);
+            }
+        };
+        
+        reader.readAsText(file);
+    });
+
+    window.addEventListener('resize', () => {
+        if (treeData) {
+            createTree(treeData, false);
+			drawConnections(); 
+        }
+    });
+
+
+
+    loadSampleData();
+</script>
+</body>
+</html>
