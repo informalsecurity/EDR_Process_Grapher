@@ -1,28 +1,89 @@
 # ============================================================
-#  Convert-DefenderATPtoProcessTree.ps1
+#  Convert-CrowdStrikeToProcessTree.ps1
+#  Converts CrowdStrike Falcon Advanced Event Search (Humio)
+#  CSV exports into process-tree JSON files consumable by
+#  the Process Tree Viewer HTML tool.
 # ============================================================
 
-$file_path = Read-Host "Provide the full path to the folder containing Defender ATP CSV export file(s)"
-$files = Get-ChildItem $file_path -Recurse -Filter *.csv
-$fcount = $files.Count
-$counter = 0
+$input_path = Read-Host "Provide the full path to a CrowdStrike CSV file OR a folder containing them"
+$input_path = $input_path.Trim().Trim('"').Trim("'")
 
-function Make-ProcessKey {
-    param([string]$MachineId, [string]$ProcessId, [string]$CreationTime, [string]$FileName)
-    if ([string]::IsNullOrWhiteSpace($ProcessId) -or $ProcessId -eq "0") { return $null }
-    if ([string]::IsNullOrWhiteSpace($FileName)) { return $null }
-    # Only treat as a process if the filename looks like an executable
-    if ($FileName -notmatch '\.(exe|dll|com|bat|cmd|ps1|vbs|js|scr|pif|msi|msc|hta|cpl)$') { return $null }
-    $ts = ""
-    if (-not [string]::IsNullOrWhiteSpace($CreationTime)) {
-        try   { $ts = [datetime]::Parse($CreationTime).ToString("yyyyMMddHHmmssfff") }
-        catch { $ts = ($CreationTime -replace "[^0-9]",""); if ($ts.Length -gt 17) { $ts = $ts.Substring(0,17) } }
-    }
-    # Key includes filename so same PID reused by different processes stays separate
-    $safeName = $FileName.ToUpper().Trim()
-    return ($MachineId + "_" + $ProcessId + "_" + $ts + "_" + $safeName).ToUpper()
+# Accept either a single file or a folder
+if (Test-Path $input_path -PathType Leaf) {
+    $files = @(Get-Item $input_path)
+    $file_path = Split-Path $input_path -Parent
+} elseif (Test-Path $input_path -PathType Container) {
+    $files = @(Get-ChildItem $input_path -Recurse -Filter *.csv)
+    $file_path = $input_path
+} else {
+    Write-Host "ERROR: path not found: $input_path"
+    exit
 }
 
+$fcount = $files.Count
+$counter = 0
+Write-Host "Found $fcount file(s) to process."
+
+# Auto-detect delimiter by sampling the header line of the first file
+$delimiter = ","
+if ($fcount -gt 0) {
+    $headerLine = Get-Content $files[0].FullName -TotalCount 1
+    $tabCount   = ($headerLine.ToCharArray() | Where-Object { $_ -eq [char]9 }).Count
+    $commaCount = ($headerLine.ToCharArray() | Where-Object { $_ -eq ',' }).Count
+    if ($tabCount -gt $commaCount) {
+        $delimiter = "`t"
+        Write-Host "Detected TAB-delimited CSV."
+    } else {
+        Write-Host "Detected COMMA-delimited CSV."
+    }
+}
+
+# -------------------------------------------------------
+# Process key: aid + TargetProcessId
+# CrowdStrike TargetProcessId is a unique 64-bit kernel
+# process ID — no timestamp needed to disambiguate.
+# -------------------------------------------------------
+function Make-ProcessKey {
+    param([string]$Aid, [string]$ProcessId)
+    if ([string]::IsNullOrWhiteSpace($ProcessId) -or $ProcessId -eq "0") { return $null }
+    # Strip scientific notation if Excel mangled the value
+    try {
+        $pid_clean = [string][long][double]$ProcessId
+    } catch {
+        $pid_clean = $ProcessId.Trim()
+    }
+    if ([string]::IsNullOrWhiteSpace($pid_clean) -or $pid_clean -eq "0") { return $null }
+    return ($Aid + "_" + $pid_clean).ToUpper()
+}
+
+# -------------------------------------------------------
+# Convert CrowdStrike unix timestamp (seconds or ms) to ISO
+# -------------------------------------------------------
+function Convert-CSTimestamp([string]$ts) {
+    if ([string]::IsNullOrWhiteSpace($ts)) { return "" }
+    try {
+        $d = [double]$ts
+        # If > 1e12 it's milliseconds, otherwise seconds
+        if ($d -gt 1000000000000) { $d = $d / 1000 }
+        return [System.DateTimeOffset]::FromUnixTimeMilliseconds([long]($d * 1000)).ToString("yyyy-MM-ddTHH:mm:ss.fff")
+    } catch { return $ts }
+}
+
+# -------------------------------------------------------
+# Extract filename from a full device path
+# e.g. \Device\HarddiskVolume3\Windows\System32\cmd.exe -> CMD.EXE
+# -------------------------------------------------------
+function Get-BaseName([string]$path) {
+    if ([string]::IsNullOrWhiteSpace($path)) { return "" }
+    $path = $path.Trim()
+    $idx = $path.LastIndexOfAny([char[]]@([char]92, [char]47))
+    if ($idx -ge 0) { return $path.Substring($idx + 1).ToUpper().Trim() }
+    return $path.ToUpper().Trim()
+}
+
+# -------------------------------------------------------
+# Add unique value to a hashtable of HashSets
+# -------------------------------------------------------
 function Add-Unique {
     param($dict, [string]$key, [string]$value)
     if ([string]::IsNullOrWhiteSpace($key))   { return }
@@ -32,10 +93,14 @@ function Add-Unique {
 }
 
 function Set-IfMissing {
-    param($dict,[string]$key,[string]$value)
-    if (-not [string]::IsNullOrWhiteSpace($key) -and -not $dict.ContainsKey($key)) { $dict[$key] = $value }
+    param($dict, [string]$key, [string]$value)
+    if ([string]::IsNullOrWhiteSpace($key)) { return }
+    if (-not $dict.ContainsKey($key)) { $dict[$key] = $value }
 }
 
+# -------------------------------------------------------
+# JSON escape - uses string,string overload explicitly
+# -------------------------------------------------------
 function EscJ([string]$s) {
     if ($null -eq $s) { return "" }
     $s = [string]$s
@@ -47,6 +112,9 @@ function EscJ([string]$s) {
     return $s
 }
 
+# -------------------------------------------------------
+# Iterative cycle-breaker
+# -------------------------------------------------------
 function Remove-Cycles($pid_dict) {
     $visited = [System.Collections.Generic.HashSet[string]]::new()
     $inStack = [System.Collections.Generic.HashSet[string]]::new()
@@ -76,10 +144,24 @@ function Remove-Cycles($pid_dict) {
     }
 }
 
-$NetworkActionTypes = [System.Collections.Generic.HashSet[string]]@("NetworkConnectionInspected","ConnectionSuccess","ConnectionFailed","ConnectionFound","InboundConnectionAccepted","ListeningConnectionCreated")
-$DnsActionTypes     = [System.Collections.Generic.HashSet[string]]@("DnsQueryResponse","DnsQueryRequest","DnsQuery")
-$FileActionTypes    = [System.Collections.Generic.HashSet[string]]@("FileCreated","FileModified","FileRenamed")
+# -------------------------------------------------------
+# Event classification
+# -------------------------------------------------------
+$ProcessEvents = [System.Collections.Generic.HashSet[string]]@(
+    "ProcessRollup2", "SyntheticProcessRollup2"
+)
 
+function Is-NetworkEvent([string]$name) {
+    return $name -match "^Network(Connect|Listen|Receive|Transmit)"
+}
+
+function Is-FileWriteEvent([string]$name) {
+    return $name -match "Written"
+}
+
+# ==================================================================
+# Main loop
+# ==================================================================
 foreach ($file in $files) {
     $counter++
     Write-Host "Working on $counter of $fcount - $($file.FullName)"
@@ -94,103 +176,114 @@ foreach ($file in $files) {
     $pname_dict    = @{}
     $hashes_dict   = @{}
     $rules_dict    = @{}
-    $xprocess_dict = @{}
 
     $system_name = ($file.Name -replace "\.csv$", "")
 
-    Write-Host "  Reading CSV..."
-    $rows = Import-Csv -Path $file.FullName
-    Write-Host "  Processing $($rows.Count) rows..."
+    Write-Host "  Streaming CSV (row by row to save memory)..."
+    $rowNum = 0
 
-    foreach ($row in $rows) {
-        $machineId  = $row."Machine Id"
-        $actionType = $row."Action Type".Trim()
+    Import-Csv -Path $file.FullName -Delimiter $delimiter | ForEach-Object {
+        $row = $_
+        $rowNum++
+        if ($rowNum % 5000 -eq 0) { Write-Host "    ...processed $rowNum rows" }
 
-        if ($actionType -ne "ProcessCreated") {
-            # Non-creation event: only attach activity to the initiating process
-            # Never create new nodes from these rows
-            $initProcId     = $row."Initiating Process Id"
-            $initProcTime   = $row."Initiating Process Creation Time"
-            $initProcName   = if ($row."Initiating Process File Name") { $row."Initiating Process File Name".ToUpper().Trim() } else { "" }
-            $initKey = Make-ProcessKey -MachineId $machineId -ProcessId $initProcId -CreationTime $initProcTime -FileName $initProcName
+        # CrowdStrike flat CSV columns are unreliable/empty across export types.
+        # The @rawstring column always contains the full event JSON - parse that.
+        $raw = [string]$row."@rawstring"
+        if ([string]::IsNullOrWhiteSpace($raw)) { return }   # 'return' = next item in ForEach-Object
+
+        try {
+            $ev = $raw | ConvertFrom-Json
+        } catch {
+            return
+        }
+
+        $aid       = [string]$ev.aid
+        $eventName = [string]$ev.event_simpleName
+        if ($null -eq $eventName) { $eventName = "" }
+        $eventName = $eventName.Trim()
+
+        if ($ProcessEvents.Contains($eventName)) {
+            # ── Process creation ──────────────────────────────────
+            $targetId = [string]$ev.TargetProcessId
+            $sourceId = [string]$ev.SourceProcessId
+            if ([string]::IsNullOrWhiteSpace($sourceId)) { $sourceId = [string]$ev.ParentProcessId }
+
+            $childKey  = Make-ProcessKey -Aid $aid -ProcessId $targetId
+            $parentKey = Make-ProcessKey -Aid $aid -ProcessId $sourceId
+
+            $procName   = Get-BaseName ([string]$ev.ImageFileName)
+            $parentName = if ($ev.ParentBaseFileName) { ([string]$ev.ParentBaseFileName).ToUpper().Trim() } else { "" }
+            $cli        = if ($ev.CommandLine)        { ([string]$ev.CommandLine).ToUpper().Trim() }        else { "" }
+            $sha256     = if ($ev.SHA256HashData)     { ([string]$ev.SHA256HashData).ToUpper().Trim() }     else { "" }
+            $userName   = if ($ev.UserName)           { ([string]$ev.UserName).ToUpper().Trim() }           else { "" }
+            $isoTime    = Convert-CSTimestamp ([string]$ev.ProcessStartTime)
+
+            $tactic     = if ($ev.Tactic)      { ([string]$ev.Tactic).Trim() }      else { "" }
+            $technique  = if ($ev.Technique)   { ([string]$ev.Technique).Trim() }   else { "" }
+            $techId     = if ($ev.TechniqueId) { ([string]$ev.TechniqueId).Trim() } else { "" }
+
+            if ($childKey) {
+                Set-IfMissing $pid_time $childKey $isoTime
+                if ($procName -ne "") { Add-Unique $pname_dict    $childKey $procName }
+                if ($cli      -ne "") { Add-Unique $cli_dict      $childKey $cli }
+                if ($userName -ne "") { Add-Unique $pid_user_dict $childKey $userName }
+                if ($sha256   -ne "" -and -not $hashes_dict.ContainsKey($childKey)) { $hashes_dict[$childKey] = $sha256 }
+                if ($eventName -ne "") { Add-Unique $rules_dict $childKey $eventName }
+                if ($tactic    -ne "") { Add-Unique $rules_dict $childKey $tactic }
+                if ($techId    -ne "") { Add-Unique $rules_dict $childKey ($techId + " - " + $technique) }
+            }
+            if ($parentKey -and $parentName -ne "") { Add-Unique $pname_dict $parentKey $parentName }
+            if ($parentKey -and $childKey -and $parentKey -ne $childKey) {
+                Add-Unique $pid_dict $parentKey $childKey
+            }
+
         } else {
-            # ProcessCreated: build the full tree - child, initiating parent, grandparent
-            $initProcId     = $row."Initiating Process Id"
-            $initProcTime   = $row."Initiating Process Creation Time"
-            $initProcName   = if ($row."Initiating Process File Name")    { $row."Initiating Process File Name".ToUpper().Trim() }    else { "" }
-            $initProcCLI    = if ($row."Initiating Process Command Line") { $row."Initiating Process Command Line".ToUpper().Trim() } else { "" }
-            $initProcSha256 = if ($row."Initiating Process SHA256")       { $row."Initiating Process SHA256".ToUpper().Trim() }       else { "" }
-            $initProcUser   = ($row."Initiating Process Account Domain" + [string][char]92 + $row."Initiating Process Account Name").ToUpper().Trim().TrimStart([string][char]92)
+            # ── Non-process event: attach activity to actor (ContextProcessId) ──
+            $ctxId    = [string]$ev.ContextProcessId
+            $actorKey = Make-ProcessKey -Aid $aid -ProcessId $ctxId
+            if (-not $actorKey) { return }   # 'return' = next item
 
-            $gpProcId   = $row."Initiating Process Parent Id"
-            $gpProcTime = $row."Initiating Process Parent Creation Time"
-            $gpProcName = if ($row."Initiating Process Parent File Name") { $row."Initiating Process Parent File Name".ToUpper().Trim() } else { "" }
+            $ctxName = [string]$ev.ContextBaseFileName
+            if (-not [string]::IsNullOrWhiteSpace($ctxName)) {
+                Add-Unique $pname_dict $actorKey $ctxName.ToUpper().Trim()
+            }
 
-            $childProcId     = $row."Process Id"
-            $childProcTime   = $row."Process Creation Time"
-            $childProcName   = if ($row."File Name")            { $row."File Name".ToUpper().Trim() }            else { "" }
-            $childProcCLI    = if ($row."Process Command Line") { $row."Process Command Line".ToUpper().Trim() } else { "" }
-            $childProcSha256 = if ($row."Sha256")               { $row."Sha256".ToUpper().Trim() }               else { "" }
-            $childProcUser   = ($row."Account Domain" + [string][char]92 + $row."Account Name").ToUpper().Trim().TrimStart([string][char]92)
+            if ($eventName -ne "") { Add-Unique $rules_dict $actorKey $eventName }
 
-            $initKey  = Make-ProcessKey -MachineId $machineId -ProcessId $initProcId  -CreationTime $initProcTime  -FileName $initProcName
-            $gpKey    = Make-ProcessKey -MachineId $machineId -ProcessId $gpProcId    -CreationTime $gpProcTime    -FileName $gpProcName
-            $childKey = Make-ProcessKey -MachineId $machineId -ProcessId $childProcId -CreationTime $childProcTime -FileName $childProcName
+            $tactic = if ($ev.Tactic)      { ([string]$ev.Tactic).Trim() }      else { "" }
+            $techId = if ($ev.TechniqueId) { ([string]$ev.TechniqueId).Trim() } else { "" }
+            $tech   = if ($ev.Technique)   { ([string]$ev.Technique).Trim() }   else { "" }
+            if ($tactic -ne "") { Add-Unique $rules_dict $actorKey $tactic }
+            if ($techId -ne "") { Add-Unique $rules_dict $actorKey ($techId + " - " + $tech) }
 
-            Set-IfMissing $pid_time $initKey  $initProcTime
-            Set-IfMissing $pid_time $gpKey    $gpProcTime
-            Set-IfMissing $pid_time $childKey $childProcTime
+            # Network
+            if (Is-NetworkEvent $eventName) {
+                $remoteIp = [string]$ev.RemoteAddressIP4
+                if ([string]::IsNullOrWhiteSpace($remoteIp)) { $remoteIp = [string]$ev.RemoteAddressString }
+                $remotePort = [string]$ev.RemotePort
+                if (-not [string]::IsNullOrWhiteSpace($remoteIp) -and $remoteIp -ne "0.0.0.0") {
+                    $remote = ($remoteIp + ":" + $remotePort).Trim(":")
+                    Add-Unique $pid_connect $actorKey $remote
+                }
+            }
 
-            if ($initProcName  -ne "" -and $initKey)  { Add-Unique $pname_dict $initKey  $initProcName }
-            if ($gpProcName    -ne "" -and $gpKey)     { Add-Unique $pname_dict $gpKey    $gpProcName }
-            if ($childProcName -ne "" -and $childKey)  { Add-Unique $pname_dict $childKey $childProcName }
+            # DNS
+            if ($eventName -eq "DnsRequest") {
+                $domain = [string]$ev.DomainName
+                if (-not [string]::IsNullOrWhiteSpace($domain)) {
+                    Add-Unique $pid_dns $actorKey $domain.ToUpper().Trim()
+                }
+            }
 
-            if ($initProcCLI  -ne "" -and $initKey)  { Add-Unique $cli_dict $initKey  $initProcCLI }
-            if ($childProcCLI -ne "" -and $childKey) { Add-Unique $cli_dict $childKey $childProcCLI }
-
-            if ($initProcSha256  -ne "" -and $initKey  -and -not $hashes_dict.ContainsKey($initKey))  { $hashes_dict[$initKey]  = $initProcSha256 }
-            if ($childProcSha256 -ne "" -and $childKey -and -not $hashes_dict.ContainsKey($childKey)) { $hashes_dict[$childKey] = $childProcSha256 }
-
-            if ($initProcUser  -notin @("","\") -and $initKey)  { Add-Unique $pid_user_dict $initKey  $initProcUser }
-            if ($childProcUser -notin @("","\") -and $childKey) { Add-Unique $pid_user_dict $childKey $childProcUser }
-
-            # Tree edges
-            if ($gpKey   -and $initKey  -and $gpKey   -ne $initKey)  { Add-Unique $pid_dict $gpKey   $initKey }
-            if ($initKey -and $childKey -and $initKey -ne $childKey) { Add-Unique $pid_dict $initKey $childKey }
-
-            # Action type on initiating process
-            if ($initKey) { Add-Unique $rules_dict $initKey $actionType }
-        }
-
-        # Attach activity to initiating process for ALL event types
-        if ($initKey) { Add-Unique $rules_dict $initKey $actionType }
-
-        if ($NetworkActionTypes.Contains($actionType)) {
-            $remoteIp = $row."Remote IP"; $remotePort = $row."Remote Port"
-            if (-not [string]::IsNullOrWhiteSpace($remoteIp)) {
-                $remote = ($remoteIp + ":" + $remotePort).Trim(":")
-                if ($initKey) { Add-Unique $pid_connect $initKey $remote }
+            # File writes - TargetFileName in the JSON has the full path
+            if (Is-FileWriteEvent $eventName) {
+                $tfn = [string]$ev.TargetFileName
+                if (-not [string]::IsNullOrWhiteSpace($tfn) -and $tfn.Length -gt 1) {
+                    Add-Unique $pid_create $actorKey $tfn.ToUpper()
+                }
             }
         }
-        if ($DnsActionTypes.Contains($actionType)) {
-            $remoteUrl = $row."Remote Url"
-            if (-not [string]::IsNullOrWhiteSpace($remoteUrl)) {
-                if ($initKey) { Add-Unique $pid_dns $initKey $remoteUrl.ToUpper().Trim() }
-            }
-        }
-        if ($FileActionTypes.Contains($actionType)) {
-            $folder = [string]($row.'Folder Path')
-            $fname2 = [string]($row.'File Name')
-            $fpath  = ""
-            if ($folder.Length -gt 1 -and $fname2.Length -gt 0) {
-                $fpath = ($folder.TrimEnd([char]92) + [string][char]92 + $fname2).ToUpper()
-            } elseif ($fname2.Length -gt 1) {
-                $fpath = $fname2.ToUpper()
-            }
-            if ($fpath.Length -gt 1) { Add-Unique $pid_create $initKey $fpath }
-        }
-        $fou = $row."File Origin Url"
-        if (-not [string]::IsNullOrWhiteSpace($fou) -and $initKey) { Add-Unique $pid_dns $initKey $fou.ToUpper().Trim() }
     }
 
     Write-Host "  Detecting and removing cycles..."
@@ -204,13 +297,17 @@ foreach ($file in $files) {
     foreach ($key in $pid_dict.Keys) {
         if (-not $allChildKeys.Contains($key)) { [void]$top_level.Add($key) }
     }
+    # Promote interesting orphans (network/dns activity but no parent edge seen)
     foreach ($key in $pname_dict.Keys) {
         if ($top_level.Contains($key)) { continue }
         $interesting = (($pid_connect[$key] -ne $null -and $pid_connect[$key].Count -gt 0) -or
                         ($pid_dns[$key]     -ne $null -and $pid_dns[$key].Count     -gt 0))
         if ($interesting -and -not $allChildKeys.Contains($key)) { [void]$top_level.Add($key) }
     }
-    $top_level = @($top_level | Sort-Object | Get-Unique)
+    $seen_tl = [System.Collections.Generic.HashSet[string]]::new()
+    $tl_unique = [System.Collections.Generic.List[string]]::new()
+    foreach ($k in $top_level) { if ($seen_tl.Add($k)) { [void]$tl_unique.Add($k) } }
+    $top_level = $tl_unique
 
     Write-Host "  Building node data..."
     $allKeys = [System.Collections.Generic.HashSet[string]]::new()
@@ -219,16 +316,16 @@ foreach ($file in $files) {
 
     $nodeMap = @{}
     foreach ($key in $allKeys) {
-        $pname = if ($pname_dict[$key] -and $pname_dict[$key].Count -gt 0) { @($pname_dict[$key]) -join ", " } else { "Unknown" }
-        $puser = if ($pid_user_dict[$key] -and $pid_user_dict[$key].Count -gt 0) { @($pid_user_dict[$key]) -join ", " } else { "Unknown" }
-        $phash = if ($hashes_dict[$key]) { $hashes_dict[$key] } else { "Unknown" }
-        $cli   = if ($cli_dict[$key] -and $cli_dict[$key].Count -gt 0) { @($cli_dict[$key]) -join " | " } else { "Unknown" }
-        $ptime = if ($pid_time[$key]) { $pid_time[$key] } else { "Unknown" }
+        $pname = if ($pname_dict[$key] -and $pname_dict[$key].Count -gt 0) { @($pname_dict[$key])[0] } else { "Unknown" }
+        $puser = if ($pid_user_dict[$key] -and $pid_user_dict[$key].Count -gt 0) { ($pid_user_dict[$key] | Sort-Object) -join ", " } else { "Unknown" }
+        $phash = if ($hashes_dict[$key])  { $hashes_dict[$key] } else { "Unknown" }
+        $cli   = if ($cli_dict[$key] -and $cli_dict[$key].Count -gt 0) { @($cli_dict[$key])[0] } else { "Unknown" }
+        $ptime = if ($pid_time[$key])     { $pid_time[$key] }    else { "Unknown" }
+
         $files       = if ($pid_create[$key]  -and $pid_create[$key].Count  -gt 0) { @($pid_create[$key])  } else { @() }
         $connections = if ($pid_connect[$key] -and $pid_connect[$key].Count -gt 0) { @($pid_connect[$key]) } else { @() }
         $queries     = if ($pid_dns[$key]     -and $pid_dns[$key].Count     -gt 0) { @($pid_dns[$key])     } else { @() }
         $rules       = if ($rules_dict[$key]  -and $rules_dict[$key].Count  -gt 0) { @($rules_dict[$key])  } else { @() }
-        $injections  = @()
 
         $hasEdges    = $pid_dict.ContainsKey($key) -and $pid_dict[$key].Count -gt 0
         $hasActivity = ($files.Count + $connections.Count + $queries.Count + $rules.Count) -gt 0
@@ -246,47 +343,123 @@ foreach ($file in $files) {
             network_connections = $connections
             dns_queries         = $queries
             sysmon_rules        = $rules
-            process_injections  = $injections
+            process_injections  = @()
         }
     }
 
-    # Exclusion prompt
-    $validRootKeys = @($top_level | Where-Object { $nodeMap.ContainsKey($_) })
-    $topLevelNames = @($validRootKeys | ForEach-Object { $nodeMap[$_].name } | Sort-Object | Get-Unique)
+    # ── Exclusion prompt (by process name, ANYWHERE in the tree) ──
+    # Count EVERY process name across ALL nodes (parents and children, any depth)
+    $nameCounts = @{}
+    foreach ($k in $nodeMap.Keys) {
+        $nm = $nodeMap[$k].name
+        if ([string]::IsNullOrWhiteSpace($nm)) { continue }
+        if ($nameCounts.ContainsKey($nm)) { $nameCounts[$nm]++ } else { $nameCounts[$nm] = 1 }
+    }
+
+    # Sort by count descending, take top 20
+    $sortedNames = @($nameCounts.GetEnumerator() | Sort-Object -Property Value -Descending)
+    $top20 = @($sortedNames | Select-Object -First 20)
 
     Write-Host ""
     Write-Host "============================================================"
-    Write-Host "  TOP-LEVEL PROCESSES for: $system_name"
-    Write-Host "  $($topLevelNames.Count) unique process name(s) found:"
+    Write-Host "  TOP 20 MOST COMMON PROCESS NAMES for: $system_name"
+    Write-Host "  ($($nameCounts.Count) unique process names total)"
     Write-Host "------------------------------------------------------------"
     $i = 1
-    foreach ($n in $topLevelNames) {
-        $instCount = @($validRootKeys | Where-Object { $nodeMap[$_].name -eq $n }).Count
-        Write-Host ("  {0,3}.  {1}  ({2} instance{3})" -f $i, $n, $instCount, $(if ($instCount -ne 1){"s"}else{""}))
+    foreach ($entry in $top20) {
+        Write-Host ("  {0,3}.  {1,-40} {2} occurrence{3}" -f $i, $entry.Key, $entry.Value, $(if ($entry.Value -ne 1){"s"}else{""}))
         $i++
     }
     Write-Host "============================================================"
     Write-Host ""
-    Write-Host "  Enter process names to EXCLUDE (comma-separated), or press ENTER to keep all:"
+    Write-Host "  Enter process names to EXCLUDE from the tree (parent OR child, any depth)."
+    Write-Host "  You can type the NUMBER from the list above, or the process NAME."
+    Write-Host "  Comma-separated. Press ENTER to keep all:"
     $excludeInput = Read-Host "  Exclude"
-    $excludeNames = @()
+
+    $excludeNames = [System.Collections.Generic.HashSet[string]]::new()
     if (-not [string]::IsNullOrWhiteSpace($excludeInput)) {
-        $excludeNames = @($excludeInput -split "," | ForEach-Object { $_.Trim().ToUpper() } | Where-Object { $_ -ne "" })
+        foreach ($token in ($excludeInput -split ",")) {
+            $t = $token.Trim()
+            if ($t -eq "") { continue }
+            # If it is a number, map to the name from the top 20 list
+            $num = 0
+            if ([int]::TryParse($t, [ref]$num)) {
+                if ($num -ge 1 -and $num -le $top20.Count) {
+                    [void]$excludeNames.Add($top20[$num - 1].Key.ToUpper())
+                }
+            } else {
+                [void]$excludeNames.Add($t.ToUpper())
+            }
+        }
     }
+
     if ($excludeNames.Count -gt 0) {
-        Write-Host "  Excluding: $($excludeNames -join ', ')"
-        $validRootKeys = @($validRootKeys | Where-Object { $excludeNames -notcontains $nodeMap[$_].name })
-        Write-Host "  $($validRootKeys.Count) top-level process(es) remaining."
+        Write-Host "  Excluding these process names everywhere in the tree:"
+        foreach ($en in $excludeNames) { Write-Host "    - $en" }
+
+        # Remove excluded nodes from nodeMap entirely
+        $removedKeys = [System.Collections.Generic.HashSet[string]]::new()
+        foreach ($k in @($nodeMap.Keys)) {
+            if ($excludeNames.Contains($nodeMap[$k].name.ToUpper())) {
+                [void]$removedKeys.Add($k)
+                $nodeMap.Remove($k)
+            }
+        }
+
+        # Remove edges pointing to or from removed keys
+        foreach ($pk in @($pid_dict.Keys)) {
+            if ($removedKeys.Contains($pk)) { $pid_dict.Remove($pk); continue }
+            $kept = [System.Collections.Generic.List[string]]::new()
+            foreach ($ck in $pid_dict[$pk]) {
+                if (-not $removedKeys.Contains($ck)) { [void]$kept.Add($ck) }
+            }
+            $pid_dict[$pk] = $kept
+        }
+
+        Write-Host "  Removed $($removedKeys.Count) node(s) from the tree."
     } else {
         Write-Host "  No exclusions applied."
     }
     Write-Host ""
 
-    # Write JSON directly via StreamWriter - no serialiser, no function calls in hot path
-    $ofile  = Join-Path $file_path ($system_name + "_processtree.json")
+    # Recompute top-level roots AFTER exclusions
+    $allChildKeys2 = [System.Collections.Generic.HashSet[string]]::new()
+    foreach ($key in $pid_dict.Keys) {
+        foreach ($child in $pid_dict[$key]) { [void]$allChildKeys2.Add($child) }
+    }
+    $validRootKeys = [System.Collections.Generic.List[string]]::new()
+    $seenRoot = [System.Collections.Generic.HashSet[string]]::new()
+    foreach ($k in $pid_dict.Keys) {
+        if (-not $allChildKeys2.Contains($k) -and $nodeMap.ContainsKey($k)) {
+            if ($seenRoot.Add($k)) { [void]$validRootKeys.Add($k) }
+        }
+    }
+    # Also include any surviving orphan nodes that have activity but no edges
+    foreach ($k in $nodeMap.Keys) {
+        if (-not $allChildKeys2.Contains($k) -and -not $pid_dict.ContainsKey($k)) {
+            if ($seenRoot.Add($k)) { [void]$validRootKeys.Add($k) }
+        }
+    }
+    Write-Host "  $($validRootKeys.Count) top-level process(es) after exclusions."
+    Write-Host ""
+
+    # ── Write JSON ────────────────────────────────────────────────
+    $ofile = Join-Path $file_path ($system_name + "_processtree.json")
+    if (Test-Path $ofile) {
+        try { Remove-Item $ofile -Force -ErrorAction Stop }
+        catch { Write-Host "  WARNING: could not delete existing file, trying a new name"; $ofile = Join-Path $file_path ($system_name + "_processtree_" + (Get-Date -Format "HHmmss") + ".json") }
+    }
     Write-Host "  Writing $ofile ..."
-    if (Test-Path $ofile) { Remove-Item $ofile -Force }
-    $writer = [System.IO.StreamWriter]::new($ofile, $false, [System.Text.Encoding]::UTF8)
+    $writer = $null
+    try {
+        $writer = [System.IO.StreamWriter]::new($ofile, $false, [System.Text.Encoding]::UTF8)
+    } catch {
+        Write-Host "  ERROR opening output file: $($_.Exception.Message)"
+        Write-Host "  Skipping this file."
+        continue
+    }
+    if ($null -eq $writer) { Write-Host "  ERROR: writer is null, skipping"; continue }
 
     $writer.WriteLine("{")
     $writer.WriteLine('  "name": "root",')
@@ -301,36 +474,26 @@ foreach ($file in $files) {
     $writer.WriteLine('  "process_injections": [],')
     $writer.WriteLine('  "children": [')
 
-    # Iterative DFS write.
-    # Stack holds [key, indent]. Always writes commas; trailing commas stripped after.
-    # $opened tracks keys whose opening brace has already been written,
-    # so when we see a key a second time we know to close it.
     $stack  = [System.Collections.Generic.Stack[object[]]]::new()
     $opened = [System.Collections.Generic.HashSet[string]]::new()
 
-    # Push root children - NO isLast tracking, always write commas, strip at end
     for ($i = $validRootKeys.Count - 1; $i -ge 0; $i--) {
         $stack.Push(@($validRootKeys[$i], 2))
     }
 
     while ($stack.Count -gt 0) {
-        $frame = $stack.Pop()
-        $key   = [string]$frame[0]
-        $ind   = [int]$frame[1]
-        $pad   = "  " * $ind
+        $frame  = $stack.Pop()
+        $key    = [string]$frame[0]
+        $ind    = [int]$frame[1]
+        $pad    = "  " * $ind
 
-        # Handle close sentinel
         if ($key.StartsWith("__CLOSE__:")) {
             $writer.WriteLine($pad + "  ]")
             $writer.WriteLine($pad + "},")
             continue
         }
 
-        if ($opened.Contains($key)) {
-            # Already written elsewhere in tree - skip entirely, write nothing
-            continue
-        }
-
+        if ($opened.Contains($key)) { continue }
         [void]$opened.Add($key)
         $node = $nodeMap[$key]
 
@@ -359,18 +522,18 @@ foreach ($file in $files) {
 
         $writer.WriteLine($pad + '  "children": [')
 
-        $childKeys = @()
+        $childKeys = [System.Collections.Generic.List[string]]::new()
         if ($pid_dict.ContainsKey($key)) {
-            $childKeys = @($pid_dict[$key] | Where-Object { $nodeMap.ContainsKey($_) })
+            foreach ($ck in $pid_dict[$key]) {
+                if ($nodeMap.ContainsKey($ck)) { [void]$childKeys.Add($ck) }
+            }
         }
 
         if ($childKeys.Count -eq 0) {
             $writer.WriteLine($pad + "  ]")
             $writer.WriteLine($pad + "},")
         } else {
-            # Push a CLOSE marker - use a special sentinel key, not the real key
             $stack.Push(@("__CLOSE__:$key", $ind))
-            # Push children in reverse so first child pops first
             for ($i = $childKeys.Count - 1; $i -ge 0; $i--) {
                 $stack.Push(@($childKeys[$i], ($ind + 2)))
             }
@@ -383,7 +546,7 @@ foreach ($file in $files) {
     $writer.Close()
     $writer.Dispose()
 
-    # Strip trailing commas before ] or } - fixes all comma issues in one pass
+    # Strip trailing commas before ] or }
     Write-Host "  Fixing trailing commas..."
     $raw = [System.IO.File]::ReadAllText($ofile)
     $raw = [System.Text.RegularExpressions.Regex]::Replace($raw, ',(\s*[\]\}])', '$1')
