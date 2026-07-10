@@ -179,8 +179,15 @@ foreach ($file in $files) {
             }
         }
         if ($FileActionTypes.Contains($actionType)) {
-            $fpath = ($row.'Folder Path' + [string][char]92 + $row.'File Name').ToUpper().Trim([string][char]92)
-            if ($fpath -notin @("","\") -and $initKey) { Add-Unique $pid_create $initKey $fpath }
+            $folder = [string]($row.'Folder Path')
+            $fname2 = [string]($row.'File Name')
+            $fpath  = ""
+            if ($folder.Length -gt 1 -and $fname2.Length -gt 0) {
+                $fpath = ($folder.TrimEnd([char]92) + [string][char]92 + $fname2).ToUpper()
+            } elseif ($fname2.Length -gt 1) {
+                $fpath = $fname2.ToUpper()
+            }
+            if ($fpath.Length -gt 1) { Add-Unique $pid_create $initKey $fpath }
         }
         $fou = $row."File Origin Url"
         if (-not [string]::IsNullOrWhiteSpace($fou) -and $initKey) { Add-Unique $pid_dns $initKey $fou.ToUpper().Trim() }
@@ -243,36 +250,96 @@ foreach ($file in $files) {
         }
     }
 
-    # Exclusion prompt
-    $validRootKeys = @($top_level | Where-Object { $nodeMap.ContainsKey($_) })
-    $topLevelNames = @($validRootKeys | ForEach-Object { $nodeMap[$_].name } | Sort-Object | Get-Unique)
+    # ── Exclusion prompt (by process name, ANYWHERE in the tree) ──
+    # Count EVERY process name across ALL nodes (parents and children, any depth)
+    $nameCounts = @{}
+    foreach ($k in $nodeMap.Keys) {
+        $nm = $nodeMap[$k].name
+        if ([string]::IsNullOrWhiteSpace($nm)) { continue }
+        if ($nameCounts.ContainsKey($nm)) { $nameCounts[$nm]++ } else { $nameCounts[$nm] = 1 }
+    }
+
+    $sortedNames = @($nameCounts.GetEnumerator() | Sort-Object -Property Value -Descending)
+    $top20 = @($sortedNames | Select-Object -First 20)
 
     Write-Host ""
     Write-Host "============================================================"
-    Write-Host "  TOP-LEVEL PROCESSES for: $system_name"
-    Write-Host "  $($topLevelNames.Count) unique process name(s) found:"
+    Write-Host "  TOP 20 MOST COMMON PROCESS NAMES for: $system_name"
+    Write-Host "  ($($nameCounts.Count) unique process names total)"
     Write-Host "------------------------------------------------------------"
     $i = 1
-    foreach ($n in $topLevelNames) {
-        $instCount = @($validRootKeys | Where-Object { $nodeMap[$_].name -eq $n }).Count
-        Write-Host ("  {0,3}.  {1}  ({2} instance{3})" -f $i, $n, $instCount, $(if ($instCount -ne 1){"s"}else{""}))
+    foreach ($entry in $top20) {
+        Write-Host ("  {0,3}.  {1,-40} {2} occurrence{3}" -f $i, $entry.Key, $entry.Value, $(if ($entry.Value -ne 1){"s"}else{""}))
         $i++
     }
     Write-Host "============================================================"
     Write-Host ""
-    Write-Host "  Enter process names to EXCLUDE (comma-separated), or press ENTER to keep all:"
+    Write-Host "  Enter process names to EXCLUDE from the tree (parent OR child, any depth)."
+    Write-Host "  You can type the NUMBER from the list above, or the process NAME."
+    Write-Host "  Comma-separated. Press ENTER to keep all:"
     $excludeInput = Read-Host "  Exclude"
-    $excludeNames = @()
+
+    $excludeNames = [System.Collections.Generic.HashSet[string]]::new()
     if (-not [string]::IsNullOrWhiteSpace($excludeInput)) {
-        $excludeNames = @($excludeInput -split "," | ForEach-Object { $_.Trim().ToUpper() } | Where-Object { $_ -ne "" })
+        foreach ($token in ($excludeInput -split ",")) {
+            $t = $token.Trim()
+            if ($t -eq "") { continue }
+            $num = 0
+            if ([int]::TryParse($t, [ref]$num)) {
+                if ($num -ge 1 -and $num -le $top20.Count) {
+                    [void]$excludeNames.Add($top20[$num - 1].Key.ToUpper())
+                }
+            } else {
+                [void]$excludeNames.Add($t.ToUpper())
+            }
+        }
     }
+
     if ($excludeNames.Count -gt 0) {
-        Write-Host "  Excluding: $($excludeNames -join ', ')"
-        $validRootKeys = @($validRootKeys | Where-Object { $excludeNames -notcontains $nodeMap[$_].name })
-        Write-Host "  $($validRootKeys.Count) top-level process(es) remaining."
+        Write-Host "  Excluding these process names everywhere in the tree:"
+        foreach ($en in $excludeNames) { Write-Host "    - $en" }
+
+        $removedKeys = [System.Collections.Generic.HashSet[string]]::new()
+        foreach ($k in @($nodeMap.Keys)) {
+            if ($excludeNames.Contains($nodeMap[$k].name.ToUpper())) {
+                [void]$removedKeys.Add($k)
+                $nodeMap.Remove($k)
+            }
+        }
+
+        foreach ($pk in @($pid_dict.Keys)) {
+            if ($removedKeys.Contains($pk)) { $pid_dict.Remove($pk); continue }
+            $kept = [System.Collections.Generic.List[string]]::new()
+            foreach ($ck in $pid_dict[$pk]) {
+                if (-not $removedKeys.Contains($ck)) { [void]$kept.Add($ck) }
+            }
+            $pid_dict[$pk] = $kept
+        }
+
+        Write-Host "  Removed $($removedKeys.Count) node(s) from the tree."
     } else {
         Write-Host "  No exclusions applied."
     }
+    Write-Host ""
+
+    # Recompute top-level roots AFTER exclusions
+    $allChildKeys2 = [System.Collections.Generic.HashSet[string]]::new()
+    foreach ($key in $pid_dict.Keys) {
+        foreach ($child in $pid_dict[$key]) { [void]$allChildKeys2.Add($child) }
+    }
+    $validRootKeys = [System.Collections.Generic.List[string]]::new()
+    $seenRoot = [System.Collections.Generic.HashSet[string]]::new()
+    foreach ($k in $pid_dict.Keys) {
+        if (-not $allChildKeys2.Contains($k) -and $nodeMap.ContainsKey($k)) {
+            if ($seenRoot.Add($k)) { [void]$validRootKeys.Add($k) }
+        }
+    }
+    foreach ($k in $nodeMap.Keys) {
+        if (-not $allChildKeys2.Contains($k) -and -not $pid_dict.ContainsKey($k)) {
+            if ($seenRoot.Add($k)) { [void]$validRootKeys.Add($k) }
+        }
+    }
+    Write-Host "  $($validRootKeys.Count) top-level process(es) after exclusions."
     Write-Host ""
 
     # Write JSON directly via StreamWriter - no serialiser, no function calls in hot path
@@ -341,8 +408,10 @@ foreach ($file in $files) {
                 $writer.WriteLine($pad + '  "' + $field + '": [],')
             } else {
                 $writer.WriteLine($pad + '  "' + $field + '": [')
-                for ($ai = 0; $ai -lt $arr.Count; $ai++) {
-                    $writer.WriteLine($pad + '    "' + (EscJ $arr[$ai]) + '",')
+                foreach ($arrItem in $arr) {
+                    $escaped = EscJ ([string]$arrItem)
+                    $line = [string]::Concat($pad, '    "', $escaped, '",')
+                    $writer.WriteLine($line)
                 }
                 $writer.WriteLine($pad + '  ],')
             }
@@ -350,9 +419,11 @@ foreach ($file in $files) {
 
         $writer.WriteLine($pad + '  "children": [')
 
-        $childKeys = @()
+        $childKeys = [System.Collections.Generic.List[string]]::new()
         if ($pid_dict.ContainsKey($key)) {
-            $childKeys = @($pid_dict[$key] | Where-Object { $nodeMap.ContainsKey($_) })
+            foreach ($ck in $pid_dict[$key]) {
+                if ($nodeMap.ContainsKey($ck)) { [void]$childKeys.Add($ck) }
+            }
         }
 
         if ($childKeys.Count -eq 0) {
